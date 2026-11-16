@@ -21,6 +21,7 @@ actions!(
     text_input,
     [
         Backspace,
+        DeleteWordBack,
         Delete,
         Left,
         Right,
@@ -42,6 +43,8 @@ pub fn bind_keys(cx: &mut App) {
     let input = Some(CONTEXT);
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, input),
+        KeyBinding::new("ctrl-backspace", DeleteWordBack, input),
+        KeyBinding::new("ctrl-w", DeleteWordBack, input),
         KeyBinding::new("delete", Delete, input),
         KeyBinding::new("left", Left, input),
         KeyBinding::new("right", Right, input),
@@ -147,6 +150,16 @@ impl TextInput {
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             self.select_to(self.previous_boundary(self.cursor_offset()), cx)
+        }
+        self.replace_text_in_range(None, "", window, cx)
+    }
+
+    /// `Ctrl+Backspace` / `Ctrl+W`: deletes the word before the caret, with the separators right
+    /// before the caret. In a path, that is the last segment: `/home/u/Documents/` → `/home/u/`.
+    fn delete_word_back(&mut self, _: &DeleteWordBack, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            let start = previous_word_start(&self.content, self.cursor_offset());
+            self.select_to(start, cx)
         }
         self.replace_text_in_range(None, "", window, cx)
     }
@@ -434,6 +447,7 @@ impl Render for TextInput {
             .track_focus(&self.focus)
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::delete_word_back))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))
@@ -637,5 +651,43 @@ impl Element for TextElement {
             input.last_bounds = Some(bounds);
             input.scroll_x = scroll_x;
         });
+    }
+}
+
+/// Start of the word before `offset`: first the separators (`/` and spaces) right before it, then
+/// the characters up to the previous separator.
+fn previous_word_start(text: &str, offset: usize) -> usize {
+    let is_separator = |c: char| c == '/' || c.is_whitespace();
+    let mut chars = text[..offset].char_indices().rev().peekable();
+    let mut start = offset;
+    while let Some(&(index, _)) = chars.peek().filter(|&&(_, c)| is_separator(c)) {
+        start = index;
+        chars.next();
+    }
+    while let Some(&(index, _)) = chars.peek().filter(|&&(_, c)| !is_separator(c)) {
+        start = index;
+        chars.next();
+    }
+    start
+}
+
+#[cfg(test)]
+mod tests {
+    use super::previous_word_start;
+
+    fn delete_word(text: &str) -> &str {
+        &text[..previous_word_start(text, text.len())]
+    }
+
+    #[test]
+    fn deletes_path_segments_and_words() {
+        assert_eq!(delete_word("/home/u/Documents/"), "/home/u/");
+        assert_eq!(delete_word("/home/u/Doc"), "/home/u/");
+        assert_eq!(delete_word("/home"), "/");
+        assert_eq!(delete_word("/"), "");
+        assert_eq!(delete_word("~/año nuevo"), "~/año ");
+        assert_eq!(delete_word("rm -rf  "), "rm ");
+        assert_eq!(delete_word(""), "");
+        assert_eq!(&"/a/bc/d"[..previous_word_start("/a/bc/d", 5)], "/a/");
     }
 }

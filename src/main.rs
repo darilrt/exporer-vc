@@ -1,8 +1,11 @@
 mod assets;
+mod complete;
 mod explorer;
+mod fileops;
 mod listing;
 mod preview;
 mod search;
+mod selection;
 mod shell;
 mod text_input;
 mod theme;

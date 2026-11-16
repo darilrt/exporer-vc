@@ -4,12 +4,15 @@
 //! It has four modes. In `Normal` the keyboard navigates the list; `i` switches to `Insert`,
 //! which edits the path in the top bar, `!` or `&` to `Command`, which types a shell command in
 //! the status bar, and `/` to `Search`, which moves the cursor to the entries that match.
-//! `Space` opens a quick look over the list with a large preview of the entry under the cursor. `Escape` or losing focus go back to `Normal`. The output of `!` commands
+//! `Space` opens a quick look over the list with a large preview of the entry under the cursor.
+//! `Tab`, `Ctrl+A` and the visual selection (`v`) mark entries, by full path, for the operations
+//! on files: `y` copies and `x` cuts them into a register that `p` pastes in the shown folder.
+//! `Escape` or losing focus go back to `Normal`. The output of `!` commands
 //! shows in a panel between the list and the status bar; `&` commands are launched detached,
 //! without output.
 
-use std::collections::VecDeque;
-use std::ffi::OsString;
+use std::collections::{HashSet, VecDeque};
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -30,9 +33,12 @@ use gpui::{
 };
 
 use crate::assets::{MONO_FONT, UI_FONT, icon};
+use crate::complete;
+use crate::fileops::{self, Register, RegisterStore};
 use crate::listing::{self, Entry};
 use crate::preview;
 use crate::search::{self, Direction};
+use crate::selection::{self, Marks};
 use crate::shell;
 use crate::text_input::{self, TextInput};
 use crate::theme::Theme;
@@ -48,6 +54,8 @@ actions!(
         Last,
         EditPath,
         ConfirmPath,
+        CompleteNext,
+        CompletePrevious,
         CancelEdit,
         EnterCommand,
         EnterLaunch,
@@ -56,6 +64,17 @@ actions!(
         NextMatch,
         PreviousMatch,
         ToggleQuickLook,
+        ToggleMark,
+        ToggleVisual,
+        ExtendDown,
+        ExtendUp,
+        MarkAll,
+        TrashEntries,
+        DeleteEntries,
+        ConfirmDelete,
+        Yank,
+        Cut,
+        Paste,
         RunCommand,
         HistoryOlder,
         HistoryNewer,
@@ -75,6 +94,10 @@ const PATH_BAR_CONTEXT: &str = "PathBar";
 const COMMAND_LINE_CONTEXT: &str = "CommandLine";
 /// Context of the status bar while a search is being typed.
 const SEARCH_LINE_CONTEXT: &str = "SearchLine";
+/// Context of the status bar while it asks before deleting for good.
+const CONFIRM_CONTEXT: &str = "Confirm";
+/// Names shown when asking before deleting; the rest are counted.
+const CONFIRM_NAMES: usize = 3;
 const ROW_HEIGHT: f32 = 32.;
 /// Height of the column names above the list and of the preview panel's title, which share the
 /// same dividing line.
@@ -115,12 +138,27 @@ const PREVIEW_IMAGE_WIDTH: f32 = 314.;
 const PREVIEW_MIN_WINDOW_WIDTH: f32 = 864.;
 /// Approximate width of a JetBrains Mono character at 16 px, used to shorten the path.
 const PATH_CHAR_WIDTH: f32 = 9.6;
+/// Height of the path bar.
+const HEADER_HEIGHT: f32 = 40.;
+/// Completions visible at once in the list under the path bar.
+const COMPLETION_ROWS: usize = 10;
+const COMPLETION_ROW_HEIGHT: f32 = 28.;
+
+/// The completions offered for the typed path while there are several.
+struct Completion {
+    /// The folder part of the text, as typed; the chosen candidate goes after it.
+    dir_text: String,
+    candidates: Vec<complete::Candidate>,
+    /// The candidate shown in the field; `None` until `Tab` goes through the list.
+    selected: Option<usize>,
+}
 
 pub fn bind_keys(cx: &mut App) {
     let list = Some(LIST_CONTEXT);
     let path_bar = Some(PATH_BAR_CONTEXT);
     let command_line = Some(COMMAND_LINE_CONTEXT);
     let search_line = Some(SEARCH_LINE_CONTEXT);
+    let confirm = Some(CONFIRM_CONTEXT);
     cx.bind_keys([
         KeyBinding::new("j", MoveDown, list),
         KeyBinding::new("down", MoveDown, list),
@@ -144,11 +182,32 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("n", NextMatch, list),
         KeyBinding::new("shift-n", PreviousMatch, list),
         KeyBinding::new("space", ToggleQuickLook, list),
+        KeyBinding::new("tab", ToggleMark, list),
+        KeyBinding::new("v", ToggleVisual, list),
+        KeyBinding::new("ctrl-a", MarkAll, list),
+        KeyBinding::new("y", Yank, list),
+        KeyBinding::new("x", Cut, list),
+        KeyBinding::new("p", Paste, list),
+        KeyBinding::new("ctrl-x", Cut, list),
+        KeyBinding::new("ctrl-v", Paste, list),
+        KeyBinding::new("shift-down", ExtendDown, list),
+        KeyBinding::new("shift-up", ExtendUp, list),
+        KeyBinding::new("d", TrashEntries, list),
+        KeyBinding::new("shift-d", DeleteEntries, list),
+        KeyBinding::new("y", ConfirmDelete, confirm),
+        KeyBinding::new("enter", ConfirmDelete, confirm),
+        KeyBinding::new("n", CancelEdit, confirm),
+        KeyBinding::new("escape", CancelEdit, confirm),
         KeyBinding::new("escape", CloseOutput, list),
-        // In text fields `ctrl-c` is still copy: this context does not cover them.
+        // Interrupts what is running in view, or copies. In text fields `ctrl-c` is still copy:
+        // this context does not cover them.
         KeyBinding::new("ctrl-c", Interrupt, list),
         KeyBinding::new("enter", ConfirmPath, path_bar),
         KeyBinding::new("escape", CancelEdit, path_bar),
+        KeyBinding::new("tab", CompleteNext, path_bar),
+        KeyBinding::new("down", CompleteNext, path_bar),
+        KeyBinding::new("shift-tab", CompletePrevious, path_bar),
+        KeyBinding::new("up", CompletePrevious, path_bar),
         KeyBinding::new("enter", RunCommand, command_line),
         KeyBinding::new("escape", CancelEdit, command_line),
         KeyBinding::new("up", HistoryOlder, command_line),
@@ -171,6 +230,8 @@ enum Mode {
     Command(CommandKind),
     /// Typing a search in the status bar.
     Search,
+    /// Asking in the status bar before deleting for good (`D`).
+    Confirm,
 }
 
 /// What to do with the typed command.
@@ -216,6 +277,24 @@ struct Job {
     dismissed: bool,
     /// Takes new output while running.
     _refresh: Option<Task<()>>,
+}
+
+/// Copying or moving entries in the background, with a row once `JOB_ROW_DELAY` passed.
+struct FileTask {
+    id: u64,
+    /// `Copying`, `Moving`…
+    verb: &'static str,
+    total: usize,
+    progress: Arc<fileops::Progress>,
+    started: Instant,
+    _work: Task<()>,
+}
+
+impl FileTask {
+    fn label(&self) -> String {
+        let done = self.progress.done().min(self.total);
+        format!("{} {done}/{}", self.verb, self.total)
+    }
 }
 
 /// How a command ended.
@@ -318,6 +397,8 @@ pub struct Explorer {
     path_input: Entity<TextInput>,
     /// Why the typed path could not be opened. Cleared when editing continues.
     path_error: Option<SharedString>,
+    /// Several completions for the typed path, listed under the bar.
+    completion: Option<Completion>,
     /// Lookup of the typed path in progress.
     _locate: Option<Task<()>>,
     command_input: Entity<TextInput>,
@@ -354,6 +435,23 @@ pub struct Explorer {
     /// The quick look floats over the list with a large preview of the entry under the cursor,
     /// whatever the window width.
     quick_look: bool,
+    /// Marked entries, from any folder.
+    marks: Marks,
+    /// Visual selection: the row where it started. The rows between it and the cursor are added
+    /// to the marks with `v`.
+    visual: Option<usize>,
+    /// What `y`/`x` saved for `p`, shared with the other windows.
+    register: RegisterStore,
+    /// The register as read for the last frame.
+    register_view: Option<Arc<Register>>,
+    /// The paths of `register_view` if it is a move, to dim them in the list.
+    cut_paths: HashSet<PathBuf>,
+    file_tasks: Vec<FileTask>,
+    next_file_task: u64,
+    /// What `D` will delete once confirmed.
+    confirm_targets: Option<Vec<PathBuf>>,
+    /// Keyboard focus of the status bar while it asks.
+    confirm_focus: FocusHandle,
     notice: Option<Notice>,
     _notice_timer: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -390,9 +488,11 @@ impl Explorer {
         let command_focus = command_input.focus_handle(cx);
         let search_input = cx.new(TextInput::new);
         let search_focus = search_input.focus_handle(cx);
+        let confirm_focus = cx.focus_handle();
         let subscriptions = vec![
             cx.subscribe(&path_input, |this, _, _: &text_input::Changed, cx| {
-                if this.path_error.take().is_some() {
+                // Typing closes the list: the next `Tab` completes the new text.
+                if this.path_error.take().is_some() | this.completion.take().is_some() {
                     cx.notify();
                 }
             }),
@@ -421,6 +521,19 @@ impl Explorer {
                     this.leave_edit(window, cx);
                 }
             }),
+            cx.on_blur(&confirm_focus, window, |this, window, cx| {
+                if window.is_window_active() {
+                    this.leave_edit(window, cx);
+                }
+            }),
+            // Another window may have pasted here or taken entries from here, or changed the
+            // register: coming back reads both again.
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    let cwd = this.cwd.clone();
+                    this.reload_if_in(&cwd, cx);
+                }
+            }),
         ];
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let mut explorer = Self {
@@ -428,6 +541,7 @@ impl Explorer {
             mode: Mode::Normal,
             path_input,
             path_error: None,
+            completion: None,
             _locate: None,
             command_input,
             command_error: None,
@@ -448,6 +562,15 @@ impl Explorer {
             preview_pending: None,
             preview_loader: preview::Loader::new().ok(),
             quick_look: false,
+            marks: Marks::default(),
+            visual: None,
+            register: RegisterStore::session(),
+            register_view: None,
+            cut_paths: HashSet::new(),
+            file_tasks: Vec::new(),
+            next_file_task: 0,
+            confirm_targets: None,
+            confirm_focus,
             notice: None,
             _notice_timer: None,
             _subscriptions: subscriptions,
@@ -468,6 +591,8 @@ impl Explorer {
     /// a fast folder does not flicker.
     fn navigate(&mut self, path: PathBuf, select: Option<OsString>, cx: &mut Context<Self>) {
         self.search_highlight = false;
+        // The rows of a visual selection belong to the folder being left.
+        self.visual = None;
         self.load(path, select, false, cx);
     }
 
@@ -513,6 +638,12 @@ impl Explorer {
             Ok(entries) => {
                 self.entries = entries;
                 self.error = None;
+                let names: HashSet<&OsStr> = self
+                    .entries
+                    .iter()
+                    .map(|entry| entry.file_name.as_os_str())
+                    .collect();
+                self.marks.retain_listed(&self.cwd, &names);
             }
             Err(error) => {
                 self.entries = Vec::new();
@@ -533,6 +664,10 @@ impl Explorer {
                 self.scroll
                     .scroll_to_item_strict(self.cursor, ScrollStrategy::Center);
             }
+        }
+        let last = self.row_count().saturating_sub(1);
+        if let Some(anchor) = &mut self.visual {
+            *anchor = (*anchor).min(last);
         }
         cx.notify();
     }
@@ -633,6 +768,7 @@ impl Explorer {
         self.path_input
             .update(cx, |input, cx| input.set_text(text, cx));
         self.mode = Mode::Insert;
+        self.visual = None;
         self.path_error = None;
         window.focus(&self.path_input.focus_handle(cx));
         cx.notify();
@@ -640,6 +776,7 @@ impl Explorer {
 
     /// Looks up the typed path in the background and, if it exists, goes there.
     fn confirm_path(&mut self, _: &ConfirmPath, window: &mut Window, cx: &mut Context<Self>) {
+        self.completion = None;
         let text = self.path_input.read(cx).text().to_owned();
         let target = listing::resolve_input(&text, &self.cwd, self.home.as_deref());
         let locate = cx
@@ -662,7 +799,79 @@ impl Explorer {
     }
 
     fn cancel_edit(&mut self, _: &CancelEdit, window: &mut Window, cx: &mut Context<Self>) {
+        // With the completions open, `Escape` only closes them.
+        if self.completion.take().is_some() {
+            cx.notify();
+            return;
+        }
         self.leave_edit(window, cx);
+    }
+
+    /// `Tab` / `↓` while editing the path: completes it as a shell does. The first `Tab` completes
+    /// what all the matches share and, if there are several, lists them; the next ones go
+    /// through the list.
+    fn complete_next(&mut self, _: &CompleteNext, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.step_completion(true, cx) {
+            self.start_completion(cx);
+        }
+    }
+
+    /// `Shift+Tab` / `↑`: goes back through the completions.
+    fn complete_previous(&mut self, _: &CompletePrevious, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.step_completion(false, cx) {
+            self.start_completion(cx);
+        }
+    }
+
+    /// Moves through the open list and puts the candidate in the field. `false` if it is closed.
+    fn step_completion(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
+        let Some(completion) = &mut self.completion else {
+            return false;
+        };
+        let count = completion.candidates.len();
+        let next = match (completion.selected, forward) {
+            (None, true) => 0,
+            (None, false) => count - 1,
+            (Some(index), true) => (index + 1) % count,
+            (Some(index), false) => (index + count - 1) % count,
+        };
+        completion.selected = Some(next);
+        let text = format!("{}{}", completion.dir_text, completion.candidates[next].text());
+        self.path_input.update(cx, |input, cx| input.set_text(text, cx));
+        cx.notify();
+        true
+    }
+
+    fn start_completion(&mut self, cx: &mut Context<Self>) {
+        let text = self.path_input.read(cx).text().to_owned();
+        let (dir_text, prefix) = complete::split(&text);
+        let dir = listing::resolve_input(dir_text, &self.cwd, self.home.as_deref());
+        let candidates = match complete::candidates(&dir, prefix) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                self.path_error = Some(listing::describe_path_error(&error).into());
+                cx.notify();
+                return;
+            }
+        };
+        if candidates.is_empty() {
+            self.path_error = Some("No matches".into());
+            cx.notify();
+            return;
+        }
+        let shared = complete::common_prefix(&candidates);
+        // A shared start shorter than the typed segment only differs in case: keep what was typed.
+        if shared.chars().count() >= prefix.chars().count() && shared != prefix {
+            let completed = format!("{dir_text}{shared}");
+            self.path_input
+                .update(cx, |input, cx| input.set_text(completed, cx));
+        }
+        self.completion = (candidates.len() > 1).then(|| Completion {
+            dir_text: dir_text.to_owned(),
+            candidates,
+            selected: None,
+        });
+        cx.notify();
     }
 
     /// Goes back to normal mode from insert or command mode, without changing folder or running
@@ -675,6 +884,8 @@ impl Explorer {
             self.set_cursor(self.search_origin, cx);
         }
         self.mode = Mode::Normal;
+        self.confirm_targets = None;
+        self.completion = None;
         self.path_error = None;
         self.command_error = None;
         self._locate = None;
@@ -702,6 +913,7 @@ impl Explorer {
         self.history.reset();
         self.command_error = None;
         self.mode = Mode::Command(kind);
+        self.visual = None;
         window.focus(&self.command_input.focus_handle(cx));
         cx.notify();
     }
@@ -897,10 +1109,11 @@ impl Explorer {
             loop {
                 cx.background_executor().timer(SPINNER_INTERVAL).await;
                 let more = this.update(cx, |this, cx| {
-                    let animating = this
-                        .jobs
-                        .iter()
-                        .any(|job| job.running() && (job.visible || this.shown == Some(job.id)));
+                    let animating = !this.file_tasks.is_empty()
+                        || this
+                            .jobs
+                            .iter()
+                            .any(|job| job.running() && (job.visible || this.shown == Some(job.id)));
                     if !animating {
                         this.spinning = false;
                         return false;
@@ -929,11 +1142,47 @@ impl Explorer {
             .map(|job| job.id)
     }
 
-    /// `Ctrl+C`: stops the most recent command.
+    /// The most recent copy or move that was not asked to stop.
+    fn latest_file_task(&self) -> Option<&FileTask> {
+        self.file_tasks
+            .iter()
+            .rev()
+            .find(|task| !task.progress.cancelled())
+    }
+
+    /// The most recent running command whose row or panel is in view.
+    fn latest_running_in_view(&self) -> Option<u64> {
+        self.jobs
+            .iter()
+            .rev()
+            .find(|job| job.running() && (job.visible || self.shown == Some(job.id)))
+            .map(|job| job.id)
+    }
+
+    /// `Ctrl+C`: stops the most recent command in view or file operation, as in a terminal. With
+    /// nothing running, it copies like `y`, as in a file manager.
     fn interrupt(&mut self, _: &Interrupt, _: &mut Window, cx: &mut Context<Self>) {
-        match self.latest_running() {
-            Some(id) => self.stop_job(id, cx),
-            None => cx.propagate(),
+        let job = self.latest_running_in_view();
+        let job_started = job.and_then(|id| self.job(id)).map(|job| job.started);
+        let task = self.latest_file_task();
+        match task {
+            Some(task) if job_started.is_none_or(|started| task.started > started) => {
+                task.progress.cancel();
+                cx.notify();
+            }
+            _ => match job {
+                Some(id) => self.stop_job(id, cx),
+                // A file operation already stopping: another press must not copy meanwhile.
+                None if !self.file_tasks.is_empty() => {}
+                None => self.fill_register(fileops::Op::Copy, cx),
+            },
+        }
+    }
+
+    fn cancel_file_task(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(task) = self.file_tasks.iter().find(|task| task.id == id) {
+            task.progress.cancel();
+            cx.notify();
         }
     }
 
@@ -1088,6 +1337,291 @@ impl Explorer {
         if self.cwd == cwd && !elsewhere {
             self.reload(cx);
         }
+    }
+
+    /// Full path of the entry in `row`; `None` for `..`.
+    fn row_path(&self, row: usize) -> Option<PathBuf> {
+        match self.row(row)? {
+            Row::Entry(entry) => Some(self.cwd.join(&entry.file_name)),
+            Row::Parent => None,
+        }
+    }
+
+    fn row_paths(&self, rows: impl Iterator<Item = usize>) -> Vec<PathBuf> {
+        rows.filter_map(|row| self.row_path(row)).collect()
+    }
+
+    fn is_marked(&self, row: usize) -> bool {
+        let in_visual = self
+            .visual
+            .is_some_and(|anchor| selection::visual_rows(anchor, self.cursor).contains(&row));
+        if in_visual {
+            return matches!(self.row(row), Some(Row::Entry(_)));
+        }
+        !self.marks.is_empty() && self.row_path(row).is_some_and(|path| self.marks.contains(&path))
+    }
+
+    /// The entry in `row` was cut and has not been pasted yet.
+    fn is_cut(&self, row: usize) -> bool {
+        !self.cut_paths.is_empty()
+            && self
+                .row_path(row)
+                .is_some_and(|path| self.cut_paths.contains(&path))
+    }
+
+    /// What an operation acts on: the marks plus a visual selection, or the entry under the
+    /// cursor. Ends the visual selection.
+    fn take_targets(&mut self) -> Vec<PathBuf> {
+        if let Some(anchor) = self.visual.take() {
+            let rows = selection::visual_rows(anchor, self.cursor);
+            self.marks.extend(self.row_paths(rows));
+        }
+        selection::targets(&self.marks, self.row_path(self.cursor))
+    }
+
+    /// `Tab`: marks or unmarks the entry under the cursor and moves down.
+    fn toggle_mark(&mut self, _: &ToggleMark, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.row_path(self.cursor) {
+            self.marks.toggle(path);
+            cx.notify();
+        }
+        self.set_cursor(self.cursor.saturating_add(1), cx);
+    }
+
+    /// `v`: starts a visual selection on the cursor row, or adds it to the marks and ends it.
+    fn toggle_visual(&mut self, _: &ToggleVisual, _: &mut Window, cx: &mut Context<Self>) {
+        match self.visual.take() {
+            Some(anchor) => {
+                let rows = selection::visual_rows(anchor, self.cursor);
+                self.marks.extend(self.row_paths(rows));
+            }
+            None => self.visual = Some(self.cursor),
+        }
+        cx.notify();
+    }
+
+    /// `Shift+↓`: starts a visual selection on the cursor row if there is none and moves down.
+    fn extend_down(&mut self, _: &ExtendDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.visual.get_or_insert(self.cursor);
+        self.set_cursor(self.cursor.saturating_add(1), cx);
+        cx.notify();
+    }
+
+    /// `Shift+↑`: like `Shift+↓`, moving up.
+    fn extend_up(&mut self, _: &ExtendUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.visual.get_or_insert(self.cursor);
+        self.set_cursor(self.cursor.saturating_sub(1), cx);
+        cx.notify();
+    }
+
+    /// `Ctrl+A`: marks every entry of the folder.
+    fn mark_all(&mut self, _: &MarkAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.marks.extend(
+            self.entries
+                .iter()
+                .map(|entry| self.cwd.join(&entry.file_name)),
+        );
+        cx.notify();
+    }
+
+    /// `y`: copies the targets into the register.
+    fn yank(&mut self, _: &Yank, _: &mut Window, cx: &mut Context<Self>) {
+        self.fill_register(fileops::Op::Copy, cx);
+    }
+
+    /// `x`: cuts the targets into the register; `p` moves them.
+    fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
+        self.fill_register(fileops::Op::Move, cx);
+    }
+
+    fn fill_register(&mut self, op: fileops::Op, cx: &mut Context<Self>) {
+        let paths = self.take_targets();
+        if paths.is_empty() {
+            cx.notify();
+            return;
+        }
+        let count = paths.len();
+        let register = Register { op, paths };
+        match self.register.save(Some(&register)) {
+            Ok(()) => {
+                self.marks.clear();
+                let done = match op {
+                    fileops::Op::Copy => "copied",
+                    fileops::Op::Move => "cut",
+                };
+                self.show_notice(format!("{} {done}", items(count)), false, cx);
+            }
+            Err(error) => {
+                let reason = fileops::describe(&error);
+                self.show_notice(format!("Could not save the register: {reason}"), true, cx);
+            }
+        }
+    }
+
+    /// `p`: copies or moves the register's entries into the shown folder, in the background.
+    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(register) = self.register.load().map(Arc::unwrap_or_clone) else {
+            self.show_notice("Nothing to paste: copy with y or cut with x".into(), true, cx);
+            return;
+        };
+        let dir = self.cwd.clone();
+        let verb = match register.op {
+            fileops::Op::Copy => "Copying",
+            fileops::Op::Move => "Moving",
+        };
+        let work = {
+            let register = register.clone();
+            let dir = dir.clone();
+            move |progress: &fileops::Progress| {
+                fileops::paste(register.op, &register.paths, &dir, progress)
+            }
+        };
+        self.start_file_task(verb, register.paths.len(), work, cx, move |this, report, cx| {
+            this.paste_finished(register, dir, report, cx);
+        });
+    }
+
+    /// Runs `work` on a thread of its own with a row that shows its progress, then `done` with
+    /// its report.
+    fn start_file_task(
+        &mut self,
+        verb: &'static str,
+        total: usize,
+        work: impl FnOnce(&fileops::Progress) -> fileops::Report + Send + 'static,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, fileops::Report, &mut Context<Self>) + 'static,
+    ) {
+        let progress = Arc::new(fileops::Progress::default());
+        let id = self.next_file_task;
+        self.next_file_task += 1;
+        let running = {
+            let progress = progress.clone();
+            blocking::unblock(move || work(&progress))
+        };
+        let watcher = cx.spawn(async move |this, cx| {
+            let report = running.await;
+            this.update(cx, |this, cx| {
+                this.file_tasks.retain(|task| task.id != id);
+                done(this, report, cx);
+            })
+            .ok();
+        });
+        self.file_tasks.push(FileTask {
+            id,
+            verb,
+            total,
+            progress,
+            started: Instant::now(),
+            _work: watcher,
+        });
+        self.start_spinner(cx);
+        cx.notify();
+    }
+
+    fn paste_finished(
+        &mut self,
+        register: Register,
+        dir: PathBuf,
+        report: fileops::Report,
+        cx: &mut Context<Self>,
+    ) {
+        // A move empties the register, except for what could not be moved. If it was replaced
+        // meanwhile (another `y` or `x`), it is left alone.
+        if register.op == fileops::Op::Move && self.register.load().as_deref() == Some(&register) {
+            let left: Vec<PathBuf> = report
+                .failures
+                .iter()
+                .map(|failure| failure.path.clone())
+                .chain(report.skipped.iter().cloned())
+                .collect();
+            let left = (!left.is_empty()).then_some(Register {
+                op: register.op,
+                paths: left,
+            });
+            self.register.save(left.as_ref()).ok();
+        }
+        let verb = match register.op {
+            fileops::Op::Copy => "Pasted",
+            fileops::Op::Move => "Moved",
+        };
+        let (text, failed) = report_text(verb, "", register.paths.len(), &report);
+        self.show_notice(text, failed, cx);
+
+        let elsewhere = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| *pending != self.cwd);
+        if self.cwd == dir && !elsewhere {
+            match report.done.first().and_then(|path| path.file_name()) {
+                Some(name) => {
+                    let name = name.to_owned();
+                    self.load(dir, Some(name), false, cx);
+                }
+                None => self.reload(cx),
+            }
+        } else {
+            // A move may have taken entries from the shown folder.
+            let cwd = self.cwd.clone();
+            self.reload_if_in(&cwd, cx);
+        }
+    }
+
+    /// `d`: moves the targets to the trash, without asking: they can be restored from there.
+    fn trash(&mut self, _: &TrashEntries, _: &mut Window, cx: &mut Context<Self>) {
+        let paths = self.take_targets();
+        if paths.is_empty() {
+            cx.notify();
+            return;
+        }
+        self.marks.clear();
+        let total = paths.len();
+        let work = move |progress: &fileops::Progress| {
+            fileops::trash_all(fileops::Trash::session().as_ref(), &paths, progress)
+        };
+        self.start_file_task("Moving to the trash", total, work, cx, move |this, report, cx| {
+            let (mut text, failed) = report_text("Moved", " to the trash", total, &report);
+            if failed {
+                text.push_str(" · D deletes permanently");
+            }
+            this.show_notice(text, failed, cx);
+            this.after_removal(cx);
+        });
+    }
+
+    /// `D`: asks in the status bar before deleting the targets for good.
+    fn ask_delete(&mut self, _: &DeleteEntries, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = self.take_targets();
+        if paths.is_empty() {
+            cx.notify();
+            return;
+        }
+        self.confirm_targets = Some(paths);
+        self.mode = Mode::Confirm;
+        window.focus(&self.confirm_focus);
+        cx.notify();
+    }
+
+    /// `y` or `Enter` while asking: deletes the targets for good.
+    fn confirm_delete(&mut self, _: &ConfirmDelete, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(paths) = self.confirm_targets.take() else {
+            return;
+        };
+        self.leave_edit(window, cx);
+        self.marks.clear();
+        let total = paths.len();
+        let work = move |progress: &fileops::Progress| fileops::delete_all(&paths, progress);
+        self.start_file_task("Deleting", total, work, cx, move |this, report, cx| {
+            let (text, failed) = report_text("Deleted", "", total, &report);
+            this.show_notice(text, failed, cx);
+            this.after_removal(cx);
+        });
+    }
+
+    /// After deleting, the shown folder is read again; the cursor stays on the same row, which
+    /// now holds the entry after the last one removed.
+    fn after_removal(&mut self, cx: &mut Context<Self>) {
+        let cwd = self.cwd.clone();
+        self.reload_if_in(&cwd, cx);
     }
 
     /// `Space`: opens or closes the quick look.
@@ -1336,6 +1870,10 @@ impl Explorer {
     /// running command stays as a row and its output does not reopen the panel by itself.
     /// Without a panel, it clears the search highlight.
     fn close_output(&mut self, _: &CloseOutput, _: &mut Window, cx: &mut Context<Self>) {
+        if self.visual.take().is_some() {
+            cx.notify();
+            return;
+        }
         if self.quick_look {
             self.quick_look = false;
             cx.notify();
@@ -1344,6 +1882,9 @@ impl Explorer {
         let Some(id) = self.shown.take() else {
             if self.search_highlight {
                 self.search_highlight = false;
+                cx.notify();
+            } else if !self.marks.is_empty() {
+                self.marks.clear();
                 cx.notify();
             } else {
                 cx.propagate();
@@ -1359,6 +1900,22 @@ impl Explorer {
     }
 
     fn click_row(&mut self, index: usize, event: &ClickEvent, cx: &mut Context<Self>) {
+        let modifiers = event.modifiers();
+        if modifiers.shift {
+            let rows = selection::visual_rows(self.cursor, index);
+            self.marks.extend(self.row_paths(rows));
+            self.set_cursor(index, cx);
+            cx.notify();
+            return;
+        }
+        if modifiers.control {
+            if let Some(path) = self.row_path(index) {
+                self.marks.toggle(path);
+            }
+            self.set_cursor(index, cx);
+            cx.notify();
+            return;
+        }
         self.set_cursor(index, cx);
         if event.click_count() >= 2 {
             self.open_cursor(cx);
@@ -1368,7 +1925,7 @@ impl Explorer {
     fn render_header(&self, t: &Theme, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let bar = div()
             .flex_none()
-            .h(px(52.))
+            .h(px(HEADER_HEIGHT))
             .px(px(14.))
             .flex()
             .items_center()
@@ -1387,6 +1944,8 @@ impl Explorer {
                 .key_context(PATH_BAR_CONTEXT)
                 .on_action(cx.listener(Self::confirm_path))
                 .on_action(cx.listener(Self::cancel_edit))
+                .on_action(cx.listener(Self::complete_next))
+                .on_action(cx.listener(Self::complete_previous))
                 .text_color(t.text_bright)
                 .child(self.path_input.clone())
                 .children(error);
@@ -1530,6 +2089,8 @@ impl Explorer {
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let is_cursor = index == self.cursor;
+        let marked = self.is_marked(index);
+        let cut = self.is_cut(index);
         let row = div()
             .id(index)
             // Without full width, each uniform_list row takes the width of its content and the
@@ -1548,6 +2109,8 @@ impl Explorer {
             .map(|row| {
                 if is_cursor {
                     row.bg(t.cursor_bg).border_color(t.accent)
+                } else if marked {
+                    row.bg(t.mark_bg).border_color(transparent_black())
                 } else {
                     row.border_color(transparent_black())
                         .hover(|style| style.bg(t.raised_bg))
@@ -1556,7 +2119,17 @@ impl Explorer {
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                 this.click_row(index, event, cx);
             }))
-            .child(div().flex_none().w(px(22.)));
+            .when(cut, |row| row.opacity(0.45))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(22.))
+                    .flex()
+                    .justify_center()
+                    .when(marked, |column| {
+                        column.child(icon(icon::CHECK, 14., t.accent))
+                    }),
+            );
 
         match self.row(index) {
             Some(Row::Entry(entry)) => {
@@ -1617,6 +2190,85 @@ impl Explorer {
                         .child(".."),
                 ),
         }
+    }
+
+    /// The list of completions, floating under the path bar over the rest of the window.
+    fn render_completion(&self, t: &Theme) -> Option<Div> {
+        let completion = self.completion.as_ref()?;
+        let count = completion.candidates.len();
+        // A window of rows that keeps the selected one in view.
+        let first = completion
+            .selected
+            .map_or(0, |index| (index + 1).saturating_sub(COMPLETION_ROWS))
+            .min(count.saturating_sub(COMPLETION_ROWS));
+        let rows = completion
+            .candidates
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(COMPLETION_ROWS)
+            .map(|(index, candidate)| {
+                let selected = completion.selected == Some(index);
+                let (icon_path, color) = if candidate.is_dir {
+                    (icon::FOLDER, t.accent)
+                } else {
+                    (listing::kind_of(&candidate.name, false).icon(), t.text_muted)
+                };
+                div()
+                    .h(px(COMPLETION_ROW_HEIGHT))
+                    .px(px(10.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .whitespace_nowrap()
+                    .map(|row| {
+                        if selected {
+                            row.bg(t.cursor_bg).border_color(t.accent)
+                        } else {
+                            row.border_color(transparent_black())
+                        }
+                    })
+                    .child(icon(icon_path, 14., color))
+                    .child(div().min_w_0().truncate().child(candidate.text()))
+            });
+        let above = (first > 0).then(|| format!("{first} more above"));
+        let below = count - first - count.min(COMPLETION_ROWS).min(count - first);
+        let below = (below > 0).then(|| format!("{below} more"));
+        let more = |text: String| {
+            div()
+                .h(px(20.))
+                .px(px(10.))
+                .flex()
+                .items_center()
+                .text_size(px(11.))
+                .text_color(t.text_faint)
+                .font_family(UI_FONT)
+                .child(text)
+        };
+        Some(
+            div()
+                .absolute()
+                .top(px(HEADER_HEIGHT + 2.))
+                .left(px(8.))
+                .min_w(px(280.))
+                .max_w(px(640.))
+                .p(px(4.))
+                .flex()
+                .flex_col()
+                .rounded(px(10.))
+                .border_1()
+                .border_color(t.border_strong)
+                .bg(t.raised_bg)
+                .shadow_lg()
+                .font_family(MONO_FONT)
+                .text_size(px(13.))
+                .text_color(t.text)
+                .children(above.map(more))
+                .children(rows)
+                .children(below.map(more)),
+        )
     }
 
     fn render_preview(&self, t: &Theme) -> impl IntoElement {
@@ -2003,7 +2655,12 @@ impl Explorer {
             .iter()
             .filter(|job| job.visible && self.shown != Some(job.id))
             .collect();
-        if visible.is_empty() {
+        let tasks: Vec<&FileTask> = self
+            .file_tasks
+            .iter()
+            .filter(|task| task.started.elapsed() >= JOB_ROW_DELAY)
+            .collect();
+        if visible.is_empty() && tasks.is_empty() {
             return None;
         }
         let hidden = visible.len().saturating_sub(MAX_JOB_ROWS);
@@ -2028,8 +2685,60 @@ impl Explorer {
                 .flex()
                 .flex_col()
                 .children(more)
-                .children(rows),
+                .children(rows)
+                .children(tasks.into_iter().map(|task| self.render_file_task(task, t, cx))),
         )
+    }
+
+    /// A copy or move in progress. The X stops it before the next file.
+    fn render_file_task(&self, task: &FileTask, t: &Theme, cx: &Context<Self>) -> Div {
+        let id = task.id;
+        let stopping = task.progress.cancelled();
+        let latest = self.latest_file_task().is_some_and(|latest| latest.id == id);
+        div()
+            .h(px(JOB_ROW_HEIGHT))
+            .pl(px(14.))
+            .pr(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .whitespace_nowrap()
+            .text_size(px(11.))
+            .text_color(t.text_faint)
+            .child(self.spinner(t))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(MONO_FONT)
+                    .text_size(px(12.))
+                    .text_color(t.text)
+                    .child(task.label()),
+            )
+            .map(|row| {
+                if stopping {
+                    row.child(div().flex_none().text_color(t.caret).child("stopping…"))
+                } else if latest {
+                    row.child(hint(t, &["Ctrl+C"], "stop").flex_none())
+                } else {
+                    row
+                }
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(MONO_FONT)
+                    .text_size(px(11.5))
+                    .child(elapsed_text(task.started.elapsed())),
+            )
+            .child(close_button(
+                t,
+                ("stop-file-task", id as usize),
+                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.cancel_file_task(id, cx);
+                }),
+            ))
     }
 
     /// A command's row. A click shows its output in the panel; the X stops it or, if it already
@@ -2137,10 +2846,12 @@ impl Explorer {
 
     fn render_status(&self, t: &Theme, cx: &Context<Self>) -> impl IntoElement {
         let (mode_label, mode_color) = match self.mode {
+            Mode::Normal if self.visual.is_some() => ("VISUAL", t.visual),
             Mode::Normal => ("NORMAL", t.accent),
             Mode::Insert => ("INSERT", t.caret),
             Mode::Command(_) => ("COMMAND", t.command),
             Mode::Search => ("SEARCH", t.search),
+            Mode::Confirm => ("DELETE", t.danger),
         };
         let bar = div()
             .flex_none()
@@ -2178,6 +2889,50 @@ impl Explorer {
                 .children(hints)
         };
 
+        if self.mode == Mode::Confirm {
+            let paths = self.confirm_targets.as_deref().unwrap_or_default();
+            let mut names: Vec<String> = paths
+                .iter()
+                .take(CONFIRM_NAMES)
+                .map(|path| {
+                    path.file_name()
+                        .unwrap_or(path.as_os_str())
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            if paths.len() > CONFIRM_NAMES {
+                names.push(format!("+{} more", paths.len() - CONFIRM_NAMES));
+            }
+            return bar
+                .key_context(CONFIRM_CONTEXT)
+                .track_focus(&self.confirm_focus)
+                .on_action(cx.listener(Self::confirm_delete))
+                .on_action(cx.listener(Self::cancel_edit))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(t.text_bright)
+                        .child(format!("Delete {} permanently?", items(paths.len()))),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(MONO_FONT)
+                        .text_size(px(12.))
+                        .text_color(t.text_muted)
+                        .child(names.join(", ")),
+                )
+                .child(hints(vec![
+                    hint(t, &["y", "Enter"], "delete"),
+                    hint(t, &["n", "Esc"], "cancel"),
+                ]));
+        }
+
         if self.mode == Mode::Search {
             let text = self.search_input.read(cx).text().to_owned();
             let count = (!text.is_empty()).then(|| match self.match_count(&text) {
@@ -2211,12 +2966,7 @@ impl Explorer {
                         )
                         .child(self.search_input.clone()),
                 )
-                .children(count)
-                .child(hints(vec![
-                    hint(t, &["Enter"], "go"),
-                    hint(t, &["↑", "↓"], "history"),
-                    hint(t, &["Esc"], "cancel"),
-                ]));
+                .children(count);
         }
 
         if let Mode::Command(kind) = self.mode {
@@ -2247,20 +2997,7 @@ impl Explorer {
                         )
                         .child(self.command_input.clone()),
                 )
-                .children(error)
-                .child(hints(vec![
-                    hint(
-                        t,
-                        &["Enter"],
-                        match kind {
-                            CommandKind::Run => "run",
-                            CommandKind::Launch => "launch",
-                        },
-                    ),
-                    hint(t, &["↑", "↓"], "history"),
-                    hint(t, &["%s"], "file"),
-                    hint(t, &["Esc"], "cancel"),
-                ]));
+                .children(error);
         }
 
         let count = self.entries.len();
@@ -2273,6 +3010,22 @@ impl Explorer {
             let position = self.cursor + 1 - usize::from(self.has_parent());
             summary.push_str(&format!(" · {position}/{count}"));
         }
+        let marked = (!self.marks.is_empty()).then(|| {
+            div()
+                .flex_none()
+                .text_color(t.accent)
+                .child(format!("{} marked", self.marks.len()))
+        });
+        let register = self.register_view.as_ref().map(|register| {
+            let action = match register.op {
+                fileops::Op::Copy => "to paste",
+                fileops::Op::Move => "to move",
+            };
+            div()
+                .flex_none()
+                .text_color(t.text_muted)
+                .child(format!("{} {action}", register.paths.len()))
+        });
         let notice = self.notice.as_ref().map(|notice| {
             if notice.failed {
                 alert(t, notice.text.clone())
@@ -2287,21 +3040,6 @@ impl Explorer {
                     .child(notice.text.clone())
             }
         });
-        let mode_hints = match self.mode {
-            Mode::Insert => vec![hint(t, &["Enter"], "go"), hint(t, &["Esc"], "cancel")],
-            _ => vec![
-                hint(t, &["j", "k"], "move"),
-                hint(t, &["l"], "open"),
-                hint(t, &["h"], "back"),
-                hint(t, &["gg", "G"], "top/bottom"),
-                hint(t, &["i"], "path"),
-                hint(t, &["!"], "command"),
-                hint(t, &["&"], "launch"),
-                hint(t, &["/"], "search"),
-                hint(t, &["Space"], "preview"),
-            ],
-        };
-
         bar.child(
             div()
                 .flex_1()
@@ -2312,11 +3050,12 @@ impl Explorer {
                 .child(listing::display_path(&self.cwd, self.home.as_deref())),
         )
         .child(div().flex_none().child(summary))
+        .children(marked)
+        .children(register)
         .when(self.pending.is_some(), |bar| {
             bar.child(div().flex_none().text_color(t.caret).child("loading…"))
         })
         .children(notice)
-        .child(hints(mode_hints))
     }
 }
 
@@ -2329,6 +3068,21 @@ impl Focusable for Explorer {
 impl Render for Explorer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.last_render = Instant::now();
+        let register = self.register.load();
+        let changed = match (&register, &self.register_view) {
+            (Some(new), Some(old)) => !Arc::ptr_eq(new, old),
+            (None, None) => false,
+            _ => true,
+        };
+        if changed {
+            self.cut_paths = match &register {
+                Some(register) if register.op == fileops::Op::Move => {
+                    register.paths.iter().cloned().collect()
+                }
+                _ => HashSet::new(),
+            };
+        }
+        self.register_view = register;
         let t = Theme::get(cx);
         let show_preview = window.viewport_size().width >= px(PREVIEW_MIN_WINDOW_WIDTH);
         if show_preview || self.quick_look {
@@ -2337,6 +3091,7 @@ impl Render for Explorer {
 
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(t.bg)
@@ -2362,6 +3117,16 @@ impl Render for Explorer {
                     .on_action(cx.listener(Self::next_match))
                     .on_action(cx.listener(Self::previous_match))
                     .on_action(cx.listener(Self::toggle_quick_look))
+                    .on_action(cx.listener(Self::toggle_mark))
+                    .on_action(cx.listener(Self::toggle_visual))
+                    .on_action(cx.listener(Self::extend_down))
+                    .on_action(cx.listener(Self::extend_up))
+                    .on_action(cx.listener(Self::mark_all))
+                    .on_action(cx.listener(Self::yank))
+                    .on_action(cx.listener(Self::cut))
+                    .on_action(cx.listener(Self::paste))
+                    .on_action(cx.listener(Self::trash))
+                    .on_action(cx.listener(Self::ask_delete))
                     .on_action(cx.listener(Self::close_output))
                     .on_action(cx.listener(Self::interrupt))
                     .flex_1()
@@ -2384,6 +3149,7 @@ impl Render for Explorer {
                     }),
             )
             .child(self.render_status(&t, cx))
+            .children(self.render_completion(&t))
     }
 }
 
@@ -2490,6 +3256,40 @@ fn longest_line<'a>(lines: impl Iterator<Item = (usize, &'a SharedString)>) -> (
 }
 
 /// Elapsed time of a running command: `4s`, `1m 12s`, `2h 5m`.
+/// The notice after an operation: `Moved 3 items to the trash`, `Pasted 2 of 5 items · stopped ·
+/// dir: cannot paste a folder into itself`. Whether something failed.
+fn report_text(verb: &str, place: &str, total: usize, report: &fileops::Report) -> (String, bool) {
+    let done = report.done.len();
+    let mut text = if done == total {
+        format!("{verb} {}{place}", items(total))
+    } else {
+        format!("{verb} {done} of {}{place}", items(total))
+    };
+    if !report.skipped.is_empty() {
+        text.push_str(" · stopped");
+    }
+    if let Some(failure) = report.failures.first() {
+        let name = failure
+            .path
+            .file_name()
+            .map_or_else(|| failure.path.to_string_lossy(), |name| name.to_string_lossy());
+        text.push_str(&format!(" · {name}: {}", failure.reason));
+        if report.failures.len() > 1 {
+            text.push_str(&format!(" (+{} more)", report.failures.len() - 1));
+        }
+    }
+    (text, !report.failures.is_empty())
+}
+
+/// `1 item`, `3 items`.
+fn items(count: usize) -> String {
+    if count == 1 {
+        "1 item".to_owned()
+    } else {
+        format!("{count} items")
+    }
+}
+
 fn elapsed_text(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
     match (seconds / 3600, seconds / 60 % 60, seconds % 60) {

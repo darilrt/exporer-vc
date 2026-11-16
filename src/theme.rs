@@ -28,6 +28,12 @@ pub struct Theme {
     pub command: Hsla,
     /// Search mode (`/`) and its prefix.
     pub search: Hsla,
+    /// Visual selection mode (`v`).
+    pub visual: Hsla,
+    /// Deleting for good.
+    pub danger: Hsla,
+    /// Background of marked rows.
+    pub mark_bg: Hsla,
     /// Background of the parts of a name that match the search.
     pub match_bg: Hsla,
     /// Text on top of the accent color.
@@ -55,6 +61,9 @@ impl Theme {
             accent: rgb(0xA78BFA).into(),
             command: rgb(0x7AA2F7).into(),
             search: rgb(0x9ECE6A).into(),
+            visual: rgb(0xF7768E).into(),
+            danger: rgb(0xF7768E).into(),
+            mark_bg: rgba(0xA78BFA26).into(),
             match_bg: rgba(0xE0AF6866).into(),
             on_accent: rgb(0x060708).into(),
         }

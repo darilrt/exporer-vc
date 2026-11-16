@@ -7,6 +7,7 @@ use gpui::{App, AssetSource, SharedString};
 
 pub mod icon {
     pub const ALERT: &str = "icons/alert.svg";
+    pub const CHECK: &str = "icons/check.svg";
     pub const CLOSE: &str = "icons/close.svg";
     #[allow(dead_code, reason = "only used by the Places sidebar, hidden for now")]
     pub const DOCUMENT: &str = "icons/document.svg";
@@ -35,6 +36,7 @@ macro_rules! embedded {
 
 const ICONS: &[(&str, &[u8])] = embedded![
     "icons/alert.svg",
+    "icons/check.svg",
     "icons/close.svg",
     "icons/document.svg",
     "icons/download.svg",
