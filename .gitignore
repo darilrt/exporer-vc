@@ -1,0 +1,7 @@
+/target
+__pycache__/
+
+# Private working notes and agent instructions
+/plan/
+/CLAUDE.md
+/AGENTS.md

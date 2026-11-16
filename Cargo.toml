@@ -1,0 +1,28 @@
+[package]
+name = "exporer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.104"
+# Already in Cargo.lock through gpui (smol): waits for `!` commands on a thread of their own.
+blocking = "1.6.2"
+# Already in Cargo.lock through gpui: channels the UI awaits without tying up a thread.
+futures = "0.3.31"
+# Pinned: the GPUI API is 0.x and changes between releases.
+# Cargo.lock starts from the lockfile published with gpui 0.2.2: with libc >= 0.2.191,
+# xattr 0.2.3 (pulled in by gpui through gpui_http_client) does not compile.
+gpui = "=0.2.2"
+# Already in Cargo.lock through gpui, with the version constraint explained above: a new session
+# for programs launched with `&` and signals to a command's process group.
+libc = "0.2.177"
+jiff = { version = "0.2.45", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
+# Already in Cargo.lock through gpui; the text field uses it to move by grapheme.
+unicode-segmentation = "1.12.0"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = true
