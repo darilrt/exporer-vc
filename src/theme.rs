@@ -26,6 +26,10 @@ pub struct Theme {
     pub accent: Hsla,
     /// Command mode (`!`) and the command prefix.
     pub command: Hsla,
+    /// Search mode (`/`) and its prefix.
+    pub search: Hsla,
+    /// Background of the parts of a name that match the search.
+    pub match_bg: Hsla,
     /// Text on top of the accent color.
     pub on_accent: Hsla,
 }
@@ -50,6 +54,8 @@ impl Theme {
             selection: rgba(0xA78BFA59).into(),
             accent: rgb(0xA78BFA).into(),
             command: rgb(0x7AA2F7).into(),
+            search: rgb(0x9ECE6A).into(),
+            match_bg: rgba(0xE0AF6866).into(),
             on_accent: rgb(0x060708).into(),
         }
     }

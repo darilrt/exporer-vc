@@ -1,9 +1,9 @@
 //! Main view: path bar, list, preview and status bar, on a single background and separated by
 //! 1 px lines.
 //!
-//! It has three modes. In `Normal` the keyboard navigates the list; `i` switches to `Insert`,
-//! which edits the path in the top bar, and `!` or `&` to `Command`, which types a shell command
-//! in the status bar. `Escape` or losing focus go back to `Normal`. The output of `!` commands
+//! It has four modes. In `Normal` the keyboard navigates the list; `i` switches to `Insert`,
+//! which edits the path in the top bar, `!` or `&` to `Command`, which types a shell command in
+//! the status bar, and `/` to `Search`, which moves the cursor to the entries that match. `Escape` or losing focus go back to `Normal`. The output of `!` commands
 //! shows in a panel between the list and the status bar; `&` commands are launched detached,
 //! without output.
 
@@ -22,13 +22,15 @@ use futures::future::{self, Either};
 
 use gpui::{
     AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, FocusHandle, Focusable,
-    FontWeight, Hsla, KeyBinding, ListHorizontalSizingBehavior, ScrollStrategy, SharedString,
-    Stateful, Subscription, Svg, Task, Transformation, UniformListScrollHandle, Window, actions,
-    div, prelude::*, px, radians, relative, svg, transparent_black, uniform_list,
+    FontWeight, HighlightStyle, Hsla, KeyBinding, ListHorizontalSizingBehavior, ScrollStrategy,
+    SharedString, Stateful, StyledText, Subscription, Svg, Task, Transformation,
+    UniformListScrollHandle, Window, actions, div, prelude::*, px, radians, relative, svg,
+    transparent_black, uniform_list,
 };
 
 use crate::assets::{MONO_FONT, UI_FONT, icon};
 use crate::listing::{self, Entry};
+use crate::search::{self, Direction};
 use crate::shell;
 use crate::text_input::{self, TextInput};
 use crate::theme::Theme;
@@ -47,6 +49,10 @@ actions!(
         CancelEdit,
         EnterCommand,
         EnterLaunch,
+        EnterSearch,
+        ConfirmSearch,
+        NextMatch,
+        PreviousMatch,
         RunCommand,
         HistoryOlder,
         HistoryNewer,
@@ -64,6 +70,8 @@ const LIST_CONTEXT: &str = "FileList";
 const PATH_BAR_CONTEXT: &str = "PathBar";
 /// Context of the status bar while a command is being typed.
 const COMMAND_LINE_CONTEXT: &str = "CommandLine";
+/// Context of the status bar while a search is being typed.
+const SEARCH_LINE_CONTEXT: &str = "SearchLine";
 const ROW_HEIGHT: f32 = 32.;
 /// Height of each line and of the output panel header.
 const OUTPUT_ROW_HEIGHT: f32 = 18.;
@@ -94,6 +102,7 @@ pub fn bind_keys(cx: &mut App) {
     let list = Some(LIST_CONTEXT);
     let path_bar = Some(PATH_BAR_CONTEXT);
     let command_line = Some(COMMAND_LINE_CONTEXT);
+    let search_line = Some(SEARCH_LINE_CONTEXT);
     cx.bind_keys([
         KeyBinding::new("j", MoveDown, list),
         KeyBinding::new("down", MoveDown, list),
@@ -113,6 +122,9 @@ pub fn bind_keys(cx: &mut App) {
         // On Linux, gpui delivers `Shift+1` as the `!` key with no modifier.
         KeyBinding::new("!", EnterCommand, list),
         KeyBinding::new("&", EnterLaunch, list),
+        KeyBinding::new("/", EnterSearch, list),
+        KeyBinding::new("n", NextMatch, list),
+        KeyBinding::new("shift-n", PreviousMatch, list),
         KeyBinding::new("escape", CloseOutput, list),
         // In text fields `ctrl-c` is still copy: this context does not cover them.
         KeyBinding::new("ctrl-c", Interrupt, list),
@@ -122,6 +134,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", CancelEdit, command_line),
         KeyBinding::new("up", HistoryOlder, command_line),
         KeyBinding::new("down", HistoryNewer, command_line),
+        KeyBinding::new("enter", ConfirmSearch, search_line),
+        KeyBinding::new("escape", CancelEdit, search_line),
+        KeyBinding::new("up", HistoryOlder, search_line),
+        KeyBinding::new("down", HistoryNewer, search_line),
         KeyBinding::new("ctrl-q", Quit, None),
     ]);
 }
@@ -134,6 +150,8 @@ enum Mode {
     Insert,
     /// Typing a shell command in the status bar.
     Command(CommandKind),
+    /// Typing a search in the status bar.
+    Search,
 }
 
 /// What to do with the typed command.
@@ -287,6 +305,14 @@ pub struct Explorer {
     /// Why the typed command could not run. Cleared when editing continues.
     command_error: Option<SharedString>,
     history: shell::History,
+    search_input: Entity<TextInput>,
+    search_history: shell::History,
+    /// Cursor row when the search started: where `Escape` or no match leaves it.
+    search_origin: usize,
+    /// Last confirmed search, for `n` and `N`.
+    last_search: Option<SharedString>,
+    /// The matches of `last_search` are highlighted in the list.
+    search_highlight: bool,
     /// `!` commands running or ended with output to view, in the order they were started.
     jobs: Vec<Job>,
     /// The command whose output the panel shows. The others show as rows above it.
@@ -334,6 +360,8 @@ impl Explorer {
         let command_input = cx.new(TextInput::new);
         let path_focus = path_input.focus_handle(cx);
         let command_focus = command_input.focus_handle(cx);
+        let search_input = cx.new(TextInput::new);
+        let search_focus = search_input.focus_handle(cx);
         let subscriptions = vec![
             cx.subscribe(&path_input, |this, _, _: &text_input::Changed, cx| {
                 if this.path_error.take().is_some() {
@@ -357,6 +385,14 @@ impl Explorer {
                     this.leave_edit(window, cx);
                 }
             }),
+            cx.subscribe(&search_input, |this, _, _: &text_input::Changed, cx| {
+                this.search_changed(cx);
+            }),
+            cx.on_blur(&search_focus, window, |this, window, cx| {
+                if window.is_window_active() {
+                    this.leave_edit(window, cx);
+                }
+            }),
         ];
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let mut explorer = Self {
@@ -368,6 +404,11 @@ impl Explorer {
             command_input,
             command_error: None,
             history: shell::History::default(),
+            search_input,
+            search_history: shell::History::default(),
+            search_origin: 0,
+            last_search: None,
+            search_highlight: false,
             jobs: Vec::new(),
             shown: None,
             pinned: false,
@@ -394,6 +435,7 @@ impl Explorer {
     /// Reads the folder in the background. Until it finishes, the previous one is still shown, so
     /// a fast folder does not flicker.
     fn navigate(&mut self, path: PathBuf, select: Option<OsString>, cx: &mut Context<Self>) {
+        self.search_highlight = false;
         self.load(path, select, false, cx);
     }
 
@@ -596,6 +638,9 @@ impl Explorer {
     fn leave_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.mode == Mode::Normal {
             return;
+        }
+        if self.mode == Mode::Search {
+            self.set_cursor(self.search_origin, cx);
         }
         self.mode = Mode::Normal;
         self.path_error = None;
@@ -1029,6 +1074,146 @@ impl Explorer {
         cx.notify();
     }
 
+    /// Switches to search mode with an empty field in the status bar.
+    fn enter_search(&mut self, _: &EnterSearch, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.search_history.reset();
+        self.search_origin = self.cursor;
+        self.mode = Mode::Search;
+        window.focus(&self.search_input.focus_handle(cx));
+        cx.notify();
+    }
+
+    /// Incremental search: the cursor goes to the first match from the row where the search
+    /// started, or back to that row if nothing matches.
+    fn search_changed(&mut self, cx: &mut Context<Self>) {
+        if self.mode != Mode::Search {
+            return;
+        }
+        let pattern = self.search_input.read(cx).text().to_owned();
+        let row = self
+            .find_match(&pattern, self.search_origin, Direction::Forward, true)
+            .map_or(self.search_origin, |(row, _)| row);
+        self.set_cursor(row, cx);
+        cx.notify();
+    }
+
+    /// `Enter` while searching: keeps the cursor on the match and remembers the search for `n`
+    /// and `N`.
+    fn confirm_search(&mut self, _: &ConfirmSearch, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.search_input.read(cx).text().to_owned();
+        if text.is_empty() {
+            self.leave_edit(window, cx);
+            return;
+        }
+        self.search_history.push(&text);
+        let found = self.match_count(&text) > 0;
+        if !found {
+            self.show_notice(format!("/{text} · no match"), true, cx);
+        }
+        self.last_search = Some(text.into());
+        self.search_highlight = true;
+        // Normal mode first, so losing the field's focus does not cancel the search.
+        self.mode = Mode::Normal;
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn next_match(&mut self, _: &NextMatch, _: &mut Window, cx: &mut Context<Self>) {
+        self.jump_to_match(Direction::Forward, cx);
+    }
+
+    fn previous_match(&mut self, _: &PreviousMatch, _: &mut Window, cx: &mut Context<Self>) {
+        self.jump_to_match(Direction::Backward, cx);
+    }
+
+    /// `n`/`N`: the next or previous match of the last search, wrapping around the ends.
+    fn jump_to_match(&mut self, direction: Direction, cx: &mut Context<Self>) {
+        let Some(pattern) = self.last_search.clone() else {
+            return;
+        };
+        self.search_highlight = true;
+        match self.find_match(&pattern, self.cursor, direction, false) {
+            Some((row, wrapped)) => {
+                self.set_cursor(row, cx);
+                let total = self.match_count(&pattern);
+                let position = (0..=row)
+                    .filter(|&row| self.row_matches(row, &pattern))
+                    .count();
+                let mut text = format!("/{pattern} · {position}/{total}");
+                if wrapped {
+                    text.push_str(" · wrapped");
+                }
+                self.show_notice(text, false, cx);
+            }
+            None => self.show_notice(format!("/{pattern} · no match"), true, cx),
+        }
+        cx.notify();
+    }
+
+    fn row_matches(&self, row: usize, pattern: &str) -> bool {
+        match self.row(row) {
+            Some(Row::Entry(entry)) => search::matches(&entry.name, pattern),
+            _ => false,
+        }
+    }
+
+    fn match_count(&self, pattern: &str) -> usize {
+        (0..self.row_count())
+            .filter(|&row| self.row_matches(row, pattern))
+            .count()
+    }
+
+    fn find_match(
+        &self,
+        pattern: &str,
+        from: usize,
+        direction: Direction,
+        include_from: bool,
+    ) -> Option<(usize, bool)> {
+        if pattern.is_empty() {
+            return None;
+        }
+        search::next_match(self.row_count(), from, direction, include_from, |row| {
+            self.row_matches(row, pattern)
+        })
+    }
+
+    /// The pattern whose matches are highlighted in the list: what is being typed while
+    /// searching, or the last search while its highlight is on.
+    fn highlighted_pattern(&self, cx: &App) -> Option<SharedString> {
+        match self.mode {
+            Mode::Search => {
+                let text = self.search_input.read(cx).text();
+                (!text.is_empty()).then(|| SharedString::from(text.to_owned()))
+            }
+            _ if self.search_highlight => self.last_search.clone(),
+            _ => None,
+        }
+    }
+
+    fn search_history_older(&mut self, _: &HistoryOlder, _: &mut Window, cx: &mut Context<Self>) {
+        let current = self.search_input.read(cx).text().to_owned();
+        let older = self.search_history.older(&current).map(str::to_owned);
+        self.show_in_search_line(older, cx);
+    }
+
+    fn search_history_newer(&mut self, _: &HistoryNewer, _: &mut Window, cx: &mut Context<Self>) {
+        let newer = self.search_history.newer().map(str::to_owned);
+        self.show_in_search_line(newer, cx);
+    }
+
+    fn show_in_search_line(&mut self, text: Option<String>, cx: &mut Context<Self>) {
+        let Some(text) = text else {
+            return;
+        };
+        self.search_input
+            .update(cx, |input, cx| input.set_text(text, cx));
+        // `set_text` does not emit `Changed`.
+        self.search_changed(cx);
+    }
+
     fn history_older(&mut self, _: &HistoryOlder, _: &mut Window, cx: &mut Context<Self>) {
         let current = self.command_input.read(cx).text().to_owned();
         let older = self.history.older(&current).map(str::to_owned);
@@ -1051,10 +1236,16 @@ impl Explorer {
     }
 
     /// `Esc`: closes the panel. A result that ended is discarded; a running command stays as a
-    /// row and its output does not reopen the panel by itself.
+    /// row and its output does not reopen the panel by itself. Without a panel, it clears the
+    /// search highlight.
     fn close_output(&mut self, _: &CloseOutput, _: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.shown.take() else {
-            cx.propagate();
+            if self.search_highlight {
+                self.search_highlight = false;
+                cx.notify();
+            } else {
+                cx.propagate();
+            }
             return;
         };
         self.pinned = false;
@@ -1171,7 +1362,7 @@ impl Explorer {
                 .flex_col()
                 .p(px(8.))
                 .when(self.has_parent(), |body| {
-                    body.child(self.render_row(0, t, cx))
+                    body.child(self.render_row(0, t, None, cx))
                 })
                 .child(
                     div()
@@ -1200,8 +1391,16 @@ impl Explorer {
                         self.row_count(),
                         cx.processor(|this, range: Range<usize>, _window, cx| {
                             let t = Theme::get(cx);
+                            let pattern = this.highlighted_pattern(cx);
                             range
-                                .map(|index| this.render_row(index, &t, cx))
+                                .map(|index| {
+                                    this.render_row(
+                                        index,
+                                        &t,
+                                        pattern.as_ref().map(AsRef::as_ref),
+                                        cx,
+                                    )
+                                })
                                 .collect::<Vec<_>>()
                         }),
                     )
@@ -1221,7 +1420,13 @@ impl Explorer {
             .child(body)
     }
 
-    fn render_row(&self, index: usize, t: &Theme, cx: &Context<Self>) -> Stateful<Div> {
+    fn render_row(
+        &self,
+        index: usize,
+        t: &Theme,
+        pattern: Option<&str>,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
         let is_cursor = index == self.cursor;
         let row = div()
             .id(index)
@@ -1268,7 +1473,11 @@ impl Explorer {
                         .text_color(t.text)
                         .font_weight(weight)
                         .child(icon(entry.kind.icon(), 16., icon_color))
-                        .child(div().min_w_0().truncate().child(entry.name.clone())),
+                        .child(div().min_w_0().truncate().child(highlighted_name(
+                            t,
+                            entry.name.clone(),
+                            pattern,
+                        ))),
                 )
                 .child(
                     div()
@@ -1668,6 +1877,7 @@ impl Explorer {
             Mode::Normal => ("NORMAL", t.accent),
             Mode::Insert => ("INSERT", t.caret),
             Mode::Command(_) => ("COMMAND", t.command),
+            Mode::Search => ("SEARCH", t.search),
         };
         let bar = div()
             .flex_none()
@@ -1704,6 +1914,47 @@ impl Explorer {
                 .gap(px(10.))
                 .children(hints)
         };
+
+        if self.mode == Mode::Search {
+            let text = self.search_input.read(cx).text().to_owned();
+            let count = (!text.is_empty()).then(|| match self.match_count(&text) {
+                0 => div().flex_none().text_color(t.caret).child("no match"),
+                1 => div().flex_none().child("1 match"),
+                n => div().flex_none().child(format!("{n} matches")),
+            });
+            return bar
+                .key_context(SEARCH_LINE_CONTEXT)
+                .on_action(cx.listener(Self::confirm_search))
+                .on_action(cx.listener(Self::cancel_edit))
+                .on_action(cx.listener(Self::search_history_older))
+                .on_action(cx.listener(Self::search_history_newer))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .font_family(MONO_FONT)
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(t.text_bright)
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(t.search)
+                                .font_weight(FontWeight::BOLD)
+                                .child("/"),
+                        )
+                        .child(self.search_input.clone()),
+                )
+                .children(count)
+                .child(hints(vec![
+                    hint(t, &["Enter"], "go"),
+                    hint(t, &["↑", "↓"], "history"),
+                    hint(t, &["Esc"], "cancel"),
+                ]));
+        }
 
         if let Mode::Command(kind) = self.mode {
             let error = self.command_error.clone().map(|error| alert(t, error));
@@ -1783,6 +2034,7 @@ impl Explorer {
                 hint(t, &["i"], "path"),
                 hint(t, &["!"], "command"),
                 hint(t, &["&"], "launch"),
+                hint(t, &["/"], "search"),
             ],
         };
 
@@ -1839,6 +2091,9 @@ impl Render for Explorer {
                     .on_action(cx.listener(Self::edit_path))
                     .on_action(cx.listener(Self::enter_command))
                     .on_action(cx.listener(Self::enter_launch))
+                    .on_action(cx.listener(Self::enter_search))
+                    .on_action(cx.listener(Self::next_match))
+                    .on_action(cx.listener(Self::previous_match))
                     .on_action(cx.listener(Self::close_output))
                     .on_action(cx.listener(Self::interrupt))
                     .flex_1()
@@ -1881,6 +2136,17 @@ fn breadcrumb(display: &str, budget: usize) -> (bool, Vec<&str>) {
         return (false, segments);
     }
     (rooted, segments)
+}
+
+/// An entry name with the matches of `pattern` highlighted.
+fn highlighted_name(t: &Theme, name: SharedString, pattern: Option<&str>) -> StyledText {
+    let ranges = pattern.map_or_else(Vec::new, |pattern| search::match_ranges(&name, pattern));
+    let style = HighlightStyle {
+        color: Some(t.text_bright),
+        background_color: Some(t.match_bg),
+        ..HighlightStyle::default()
+    };
+    StyledText::new(name).with_highlights(ranges.into_iter().map(|range| (range, style)))
 }
 
 /// `! command`, cut with `…` if it does not fit.

@@ -14,6 +14,9 @@ Zed editor.
 
 - **Vim-style navigation:** `j`/`k` to move, `l` to enter a folder, `h` to go up, `gg`/`G` to jump
   to the first or last row. Going up leaves the cursor on the folder you came from.
+- **Search** the current folder with `/`, as in vim: the cursor jumps to the first match as you
+  type and the matches are highlighted; `n`/`N` go to the next or previous one. Matching ignores
+  case unless the search has an uppercase letter.
 - **Edit the path** with `i`: type an absolute path, a relative one, `~` or `..`, and press `Enter`.
   Typing a file's path opens its folder with the file selected.
 - **Run shell commands** in the current folder with `!`. The output shows live in a panel below the
@@ -29,24 +32,28 @@ Zed editor.
 
 ## Keys
 
-| Key                     | Action                                            |
-| ----------------------- | ------------------------------------------------- |
-| `j` / `↓`               | Move down                                         |
-| `k` / `↑`               | Move up                                           |
-| `l` / `→` / `Enter`     | Open the folder under the cursor                  |
-| `h` / `←` / `Backspace` | Go to the parent folder                           |
-| `gg` / `Home`           | First row                                         |
-| `G` / `End`             | Last row                                          |
-| `i`                     | Edit the path                                     |
-| `!`                     | Run a shell command                               |
-| `&`                     | Launch a program detached                         |
-| `Ctrl+C`                | Interrupt the most recent command (again to kill) |
-| `Esc`                   | Close the output panel                            |
-| `Ctrl+Q`                | Quit                                              |
+| Key                     | Action                                                |
+| ----------------------- | ----------------------------------------------------- |
+| `j` / `↓`               | Move down                                             |
+| `k` / `↑`               | Move up                                               |
+| `l` / `→` / `Enter`     | Open the folder under the cursor                      |
+| `h` / `←` / `Backspace` | Go to the parent folder                               |
+| `gg` / `Home`           | First row                                             |
+| `G` / `End`             | Last row                                              |
+| `/`                     | Search the current folder                             |
+| `n` / `N`               | Next / previous match                                 |
+| `i`                     | Edit the path                                         |
+| `!`                     | Run a shell command                                   |
+| `&`                     | Launch a program detached                             |
+| `Ctrl+C`                | Interrupt the most recent command (again to kill)     |
+| `Esc`                   | Close the output panel, or clear the search highlight |
+| `Ctrl+Q`                | Quit                                                  |
 
-While editing the path, `Enter` goes there and `Esc` cancels. On the command line (`!` or `&`),
-`Enter` runs it, `↑`/`↓` walk the history, `%s` is the entry under the cursor, `%%` is a literal
-`%` and `Esc` cancels. Text fields support selection with `Shift`, `Ctrl+A` and the clipboard.
+While searching, `Enter` keeps the cursor on the match, `Esc` goes back to where it was and `↑`/`↓`
+walk the search history. While editing the path, `Enter` goes there and `Esc` cancels. On the
+command line (`!` or `&`), `Enter` runs it, `↑`/`↓` walk the history, `%s` is the entry under the
+cursor, `%%` is a literal `%` and `Esc` cancels. Text fields support selection with `Shift`,
+`Ctrl+A` and the clipboard.
 
 With the mouse: click selects a row, double-click opens a folder, the wheel scrolls, clicking a
 command's row shows its output in the panel, and its `×` stops it (or discards a finished result).
