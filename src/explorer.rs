@@ -3,7 +3,8 @@
 //!
 //! It has four modes. In `Normal` the keyboard navigates the list; `i` switches to `Insert`,
 //! which edits the path in the top bar, `!` or `&` to `Command`, which types a shell command in
-//! the status bar, and `/` to `Search`, which moves the cursor to the entries that match. `Escape` or losing focus go back to `Normal`. The output of `!` commands
+//! the status bar, and `/` to `Search`, which moves the cursor to the entries that match.
+//! `Space` opens a quick look over the list with a large preview of the entry under the cursor. `Escape` or losing focus go back to `Normal`. The output of `!` commands
 //! shows in a panel between the list and the status bar; `&` commands are launched detached,
 //! without output.
 
@@ -22,14 +23,15 @@ use futures::future::{self, Either};
 
 use gpui::{
     AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, FocusHandle, Focusable,
-    FontWeight, HighlightStyle, Hsla, KeyBinding, ListHorizontalSizingBehavior, ScrollStrategy,
-    SharedString, Stateful, StyledText, Subscription, Svg, Task, Transformation,
-    UniformListScrollHandle, Window, actions, div, prelude::*, px, radians, relative, svg,
-    transparent_black, uniform_list,
+    FontWeight, HighlightStyle, Hsla, ImageSource, KeyBinding, ListHorizontalSizingBehavior,
+    ObjectFit, ScrollStrategy, SharedString, Stateful, StyledImage, StyledText, Subscription, Svg,
+    Task, Transformation, UniformListScrollHandle, Window, actions, div, img, prelude::*, px,
+    radians, relative, svg, transparent_black, uniform_list,
 };
 
 use crate::assets::{MONO_FONT, UI_FONT, icon};
 use crate::listing::{self, Entry};
+use crate::preview;
 use crate::search::{self, Direction};
 use crate::shell;
 use crate::text_input::{self, TextInput};
@@ -53,6 +55,7 @@ actions!(
         ConfirmSearch,
         NextMatch,
         PreviousMatch,
+        ToggleQuickLook,
         RunCommand,
         HistoryOlder,
         HistoryNewer,
@@ -93,6 +96,18 @@ const FLOOD_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_JOB_ROWS: usize = 5;
 /// How long the notice of a command that ended without printing anything stays visible.
 const NOTICE_DURATION: Duration = Duration::from_secs(5);
+/// The image preview waits this long without the cursor moving before decoding, so holding `j`
+/// does not decode every image on the way.
+const PREVIEW_DELAY: Duration = Duration::from_millis(60);
+/// Image thumbnails kept in memory.
+const PREVIEW_CACHE_SIZE: usize = 16;
+/// Height limits of the image frame in the preview panel; the frame follows the image's
+/// proportion in between.
+const PREVIEW_FRAME_MIN: f32 = 160.;
+const PREVIEW_FRAME_MAX: f32 = 420.;
+/// Width available for the image inside the frame: panel (360) minus padding (2 × 14), border
+/// (2 × 1) and the frame's own padding (2 × 8).
+const PREVIEW_IMAGE_WIDTH: f32 = 314.;
 /// Below this window width the preview is hidden to leave room for the list.
 const PREVIEW_MIN_WINDOW_WIDTH: f32 = 864.;
 /// Approximate width of a JetBrains Mono character at 16 px, used to shorten the path.
@@ -125,6 +140,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("/", EnterSearch, list),
         KeyBinding::new("n", NextMatch, list),
         KeyBinding::new("shift-n", PreviousMatch, list),
+        KeyBinding::new("space", ToggleQuickLook, list),
         KeyBinding::new("escape", CloseOutput, list),
         // In text fields `ctrl-c` is still copy: this context does not cover them.
         KeyBinding::new("ctrl-c", Interrupt, list),
@@ -326,6 +342,15 @@ pub struct Explorer {
     spinning: bool,
     /// When the view was last drawn.
     last_render: Instant,
+    /// Image thumbnails, and failures so they are not retried on every frame.
+    previews: preview::Cache<preview::Key, Result<preview::Thumbnail, preview::Failure>>,
+    /// Thumbnail being loaded. Replacing it cancels the previous one if it has not started.
+    preview_pending: Option<(preview::Key, Task<()>)>,
+    /// `None` if its thread could not start: then there are no image previews.
+    preview_loader: Option<preview::Loader>,
+    /// The quick look floats over the list with a large preview of the entry under the cursor,
+    /// whatever the window width.
+    quick_look: bool,
     notice: Option<Notice>,
     _notice_timer: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -416,6 +441,10 @@ impl Explorer {
             spinner_frame: 0,
             spinning: false,
             last_render: Instant::now(),
+            previews: preview::Cache::new(PREVIEW_CACHE_SIZE),
+            preview_pending: None,
+            preview_loader: preview::Loader::new().ok(),
+            quick_look: false,
             notice: None,
             _notice_timer: None,
             _subscriptions: subscriptions,
@@ -1058,6 +1087,71 @@ impl Explorer {
         }
     }
 
+    /// `Space`: opens or closes the quick look.
+    fn toggle_quick_look(&mut self, _: &ToggleQuickLook, _: &mut Window, cx: &mut Context<Self>) {
+        self.quick_look = !self.quick_look;
+        cx.notify();
+    }
+
+    /// The thumbnail of the entry under the cursor, or why there is none, once it is loaded.
+    fn cursor_thumbnail(&self) -> Option<&Result<preview::Thumbnail, preview::Failure>> {
+        self.cursor_preview_key()
+            .and_then(|key| self.previews.peek(&key))
+    }
+
+    /// Key of the image preview for the entry under the cursor, if it can have one.
+    fn cursor_preview_key(&self) -> Option<preview::Key> {
+        match self.row(self.cursor)? {
+            Row::Entry(entry) if !entry.is_dir() && preview::can_preview(&entry.name) => {
+                Some(preview::Key {
+                    path: self.cwd.join(&entry.file_name),
+                    len: entry.len,
+                    modified: entry.modified,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Starts loading the thumbnail of the entry under the cursor, unless it is cached or
+    /// already loading. Called while drawing, so every way of moving the cursor is covered.
+    fn request_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(key), Some(loader)) = (self.cursor_preview_key(), self.preview_loader.clone())
+        else {
+            self.preview_pending = None;
+            return;
+        };
+        if self.previews.touch(&key) {
+            return;
+        }
+        if self
+            .preview_pending
+            .as_ref()
+            .is_some_and(|(pending, _)| *pending == key)
+        {
+            return;
+        }
+        let path = key.path.clone();
+        let loaded_key = key.clone();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(PREVIEW_DELAY).await;
+            let result = loader
+                .load(path)
+                .await
+                .unwrap_or(Err(preview::Failure::Unreadable));
+            this.update_in(cx, |this, window, cx| {
+                this.preview_pending = None;
+                // Free the GPU texture of the thumbnail that leaves the cache.
+                if let Some(Ok(evicted)) = this.previews.insert(loaded_key, result) {
+                    cx.drop_image(evicted.image, Some(window));
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.preview_pending = Some((key, task));
+    }
+
     fn show_notice(&mut self, text: String, failed: bool, cx: &mut Context<Self>) {
         self.notice = Some(Notice {
             text: text.into(),
@@ -1235,10 +1329,15 @@ impl Explorer {
         cx.notify();
     }
 
-    /// `Esc`: closes the panel. A result that ended is discarded; a running command stays as a
-    /// row and its output does not reopen the panel by itself. Without a panel, it clears the
-    /// search highlight.
+    /// `Esc`: closes the quick look, or else the panel. A result that ended is discarded; a
+    /// running command stays as a row and its output does not reopen the panel by itself.
+    /// Without a panel, it clears the search highlight.
     fn close_output(&mut self, _: &CloseOutput, _: &mut Window, cx: &mut Context<Self>) {
+        if self.quick_look {
+            self.quick_look = false;
+            cx.notify();
+            return;
+        }
         let Some(id) = self.shown.take() else {
             if self.search_highlight {
                 self.search_highlight = false;
@@ -1528,16 +1627,32 @@ impl Explorer {
             .border_color(t.border)
             .child(section_title(t, "PREVIEW"));
 
-        let frame = |icon_path: &'static str| {
+        let frame = |height: f32| {
             div()
-                .h(px(190.))
+                .h(px(height))
                 .flex()
                 .items_center()
                 .justify_center()
                 .rounded(px(10.))
                 .border_1()
                 .border_color(t.border_strong)
-                .child(icon(icon_path, 48., t.text_faint))
+                .overflow_hidden()
+        };
+        let icon_frame = |icon_path: &'static str, message: Option<&'static str>| {
+            frame(190.).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(icon(icon_path, 48., t.text_faint))
+                    .children(message.map(|message| {
+                        div()
+                            .text_size(px(11.))
+                            .text_color(t.text_faint)
+                            .child(message)
+                    })),
+            )
         };
         let title = |name: SharedString, subtitle: SharedString| {
             div()
@@ -1562,17 +1677,34 @@ impl Explorer {
 
         let content = match self.row(self.cursor) {
             Some(Row::Entry(entry)) => {
-                let subtitle = if entry.is_dir() {
-                    entry.type_text.clone()
-                } else {
-                    format!("{} · {}", entry.type_text, entry.size_text).into()
+                let thumbnail = self.cursor_thumbnail();
+                let subtitle = entry_subtitle(entry, thumbnail);
+                let image_frame = match thumbnail {
+                    Some(Ok(thumbnail)) => {
+                        let proportion = thumbnail.height as f32 / thumbnail.width.max(1) as f32;
+                        let height = (PREVIEW_IMAGE_WIDTH * proportion + 16.)
+                            .clamp(PREVIEW_FRAME_MIN, PREVIEW_FRAME_MAX);
+                        frame(height).p(px(8.)).child(
+                            img(ImageSource::Render(thumbnail.image.clone()))
+                                .size_full()
+                                .object_fit(ObjectFit::Contain),
+                        )
+                    }
+                    Some(Err(preview::Failure::TooLarge)) => {
+                        icon_frame(entry.kind.icon(), Some("Too large to preview"))
+                    }
+                    Some(Err(preview::Failure::Unreadable)) => {
+                        icon_frame(entry.kind.icon(), Some("No preview"))
+                    }
+                    // Not an image, or still loading.
+                    None => icon_frame(entry.kind.icon(), None),
                 };
                 Some(
                     div()
                         .flex()
                         .flex_col()
                         .gap(px(14.))
-                        .child(frame(entry.kind.icon()))
+                        .child(image_frame)
                         .child(title(entry.name.clone(), subtitle))
                         .child(
                             div()
@@ -1614,7 +1746,7 @@ impl Explorer {
                         .flex()
                         .flex_col()
                         .gap(px(14.))
-                        .child(frame(icon::PARENT))
+                        .child(icon_frame(icon::PARENT, None))
                         .child(title("..".into(), subtitle.into())),
                 )
             }
@@ -1631,6 +1763,134 @@ impl Explorer {
             .overflow_hidden()
             .child(header)
             .child(div().p(px(14.)).children(content))
+    }
+
+    /// The quick look: a large preview of the entry under the cursor floating over the list.
+    /// `None` when closed or when there is nothing under the cursor.
+    fn render_quick_look(&self, t: &Theme) -> Option<Div> {
+        if !self.quick_look {
+            return None;
+        }
+        let large_icon = |icon_path: &'static str, message: Option<&'static str>| {
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(12.))
+                .child(icon(icon_path, 72., t.text_faint))
+                .children(message.map(|message| {
+                    div()
+                        .text_size(px(12.))
+                        .text_color(t.text_faint)
+                        .child(message)
+                }))
+                .into_any_element()
+        };
+        let (name, subtitle, body): (SharedString, SharedString, AnyElement) =
+            match self.row(self.cursor)? {
+                Row::Entry(entry) => {
+                    let thumbnail = self.cursor_thumbnail();
+                    let subtitle = if entry.is_dir() {
+                        format!("{} · {}", entry.type_text, entry.modified_text)
+                    } else {
+                        format!(
+                            "{} · {}",
+                            entry_subtitle(entry, thumbnail),
+                            entry.modified_text
+                        )
+                    };
+                    let body = match thumbnail {
+                        // Never enlarged past the thumbnail: small images stay sharp.
+                        Some(Ok(thumbnail)) => img(ImageSource::Render(thumbnail.image.clone()))
+                            .size_full()
+                            .object_fit(ObjectFit::ScaleDown)
+                            .into_any_element(),
+                        Some(Err(preview::Failure::TooLarge)) => {
+                            large_icon(entry.kind.icon(), Some("Too large to preview"))
+                        }
+                        Some(Err(preview::Failure::Unreadable)) => {
+                            large_icon(entry.kind.icon(), Some("No preview"))
+                        }
+                        None => large_icon(entry.kind.icon(), None),
+                    };
+                    (entry.name.clone(), subtitle.into(), body)
+                }
+                Row::Parent => {
+                    let parent = self.cwd.parent().unwrap_or(&self.cwd);
+                    let subtitle = listing::display_path(parent, self.home.as_deref());
+                    ("..".into(), subtitle.into(), large_icon(icon::PARENT, None))
+                }
+            };
+        let card = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .rounded(px(12.))
+            .border_1()
+            .border_color(t.border_strong)
+            .bg(t.bg)
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(16.))
+                    .py(px(10.))
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .border_b_1()
+                    .border_color(t.border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .font_family(MONO_FONT)
+                                    .text_size(px(14.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(t.text)
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .text_color(t.text_faint)
+                                    .child(subtitle),
+                            ),
+                    )
+                    .child(
+                        hint(t, &["Space"], "close")
+                            .flex_none()
+                            .text_size(px(11.))
+                            .text_color(t.text_faint),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .p(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(body),
+            );
+        // An opaque backdrop over the whole list area, so nothing of the list shows around the
+        // card. Clicks do not go through to the list.
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .p(px(12.))
+                .bg(t.bg)
+                .occlude()
+                .child(card),
+        )
     }
 
     /// Panel with a command's output, full width. It takes what it needs up to
@@ -2035,6 +2295,7 @@ impl Explorer {
                 hint(t, &["!"], "command"),
                 hint(t, &["&"], "launch"),
                 hint(t, &["/"], "search"),
+                hint(t, &["Space"], "preview"),
             ],
         };
 
@@ -2067,6 +2328,9 @@ impl Render for Explorer {
         self.last_render = Instant::now();
         let t = Theme::get(cx);
         let show_preview = window.viewport_size().width >= px(PREVIEW_MIN_WINDOW_WIDTH);
+        if show_preview || self.quick_look {
+            self.request_preview(window, cx);
+        }
 
         div()
             .size_full()
@@ -2094,6 +2358,7 @@ impl Render for Explorer {
                     .on_action(cx.listener(Self::enter_search))
                     .on_action(cx.listener(Self::next_match))
                     .on_action(cx.listener(Self::previous_match))
+                    .on_action(cx.listener(Self::toggle_quick_look))
                     .on_action(cx.listener(Self::close_output))
                     .on_action(cx.listener(Self::interrupt))
                     .flex_1()
@@ -2104,9 +2369,11 @@ impl Render for Explorer {
                         div()
                             .flex_1()
                             .min_h_0()
+                            .relative()
                             .flex()
                             .child(self.render_list(&t, cx))
-                            .when(show_preview, |body| body.child(self.render_preview(&t))),
+                            .when(show_preview, |body| body.child(self.render_preview(&t)))
+                            .children(self.render_quick_look(&t)),
                     )
                     .children(self.render_jobs(&t, cx))
                     .when_some(self.shown_job(), |body, job| {
@@ -2136,6 +2403,22 @@ fn breadcrumb(display: &str, budget: usize) -> (bool, Vec<&str>) {
         return (false, segments);
     }
     (rooted, segments)
+}
+
+/// Type, dimensions (for an image with a thumbnail) and size of a file; just the type for a folder.
+fn entry_subtitle(
+    entry: &Entry,
+    thumbnail: Option<&Result<preview::Thumbnail, preview::Failure>>,
+) -> SharedString {
+    match thumbnail {
+        _ if entry.is_dir() => entry.type_text.clone(),
+        Some(Ok(thumbnail)) => format!(
+            "{} · {} × {} · {}",
+            entry.type_text, thumbnail.width, thumbnail.height, entry.size_text
+        )
+        .into(),
+        _ => format!("{} · {}", entry.type_text, entry.size_text).into(),
+    }
 }
 
 /// An entry name with the matches of `pattern` highlighted.

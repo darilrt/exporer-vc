@@ -7,6 +7,7 @@ use std::fs::{self, DirEntry, Metadata};
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 
 use gpui::SharedString;
 use jiff::Timestamp;
@@ -38,6 +39,9 @@ pub struct Entry {
     pub file_name: OsString,
     pub name: SharedString,
     pub kind: Kind,
+    /// Size in bytes; 0 for folders and unreadable entries.
+    pub len: u64,
+    pub modified: Option<SystemTime>,
     pub size_text: SharedString,
     pub modified_text: SharedString,
     pub permissions_text: SharedString,
@@ -90,9 +94,12 @@ fn make_entry(item: &DirEntry, tz: &TimeZone, today: Date) -> Entry {
         Some(m) if !is_dir => format_size(m.len()),
         _ => EMPTY.to_owned(),
     };
-    let modified_text = metadata
-        .as_ref()
-        .and_then(|m| m.modified().ok())
+    let len = match &metadata {
+        Some(m) if !is_dir => m.len(),
+        _ => 0,
+    };
+    let modified = metadata.as_ref().and_then(|m| m.modified().ok());
+    let modified_text = modified
         .and_then(|t| Timestamp::try_from(t).ok())
         .map(|ts| format_modified(tz.to_datetime(ts), today))
         .unwrap_or_else(|| EMPTY.to_owned());
@@ -115,6 +122,8 @@ fn make_entry(item: &DirEntry, tz: &TimeZone, today: Date) -> Entry {
         file_name,
         name: name.into(),
         kind,
+        len,
+        modified,
         size_text: size_text.into(),
         modified_text: modified_text.into(),
         permissions_text: permissions_text.into(),
@@ -437,6 +446,8 @@ mod tests {
             file_name: name.into(),
             name: name.to_owned().into(),
             kind: kind_of(name, is_dir),
+            len: 0,
+            modified: None,
             size_text: SharedString::default(),
             modified_text: SharedString::default(),
             permissions_text: SharedString::default(),
@@ -624,6 +635,9 @@ mod tests {
         assert_eq!(entries[0].type_text.as_ref(), "Link · Folder");
         assert_eq!(entries[2].kind, Kind::Image);
         assert_eq!(entries[3].size_text.as_ref(), "4 B");
+        assert_eq!(entries[3].len, 4);
+        assert!(entries[3].modified.is_some());
+        assert_eq!(entries[1].len, 0, "folders have no size");
         assert!(entries[3].modified_text.starts_with("today "));
         assert_eq!(entries[4].type_text.as_ref(), "Broken link");
     }

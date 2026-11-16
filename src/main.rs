@@ -1,6 +1,7 @@
 mod assets;
 mod explorer;
 mod listing;
+mod preview;
 mod search;
 mod shell;
 mod text_input;

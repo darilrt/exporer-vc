@@ -28,26 +28,32 @@ Zed editor.
 - **Launch programs detached** with `&`, for example `& code .` or `& xdg-open %s`. They run in a
   new session with no terminal and no connection to exporer, so they keep running after you close
   it.
-- **Preview panel** with the entry's type, size, modification date and permissions.
+- **Preview panel** with the entry's type, size, modification date and permissions, and a preview
+  of images: PNG, JPEG, GIF, WebP, BMP, TIFF, SVG and other formats, turned upright from their
+  EXIF orientation. Thumbnails are decoded in the background and only the last few are kept in
+  memory.
+- **Quick look** with `Space`: a large preview of the entry under the cursor floats over the list,
+  whatever the window size, and follows the cursor as you move.
 
 ## Keys
 
-| Key                     | Action                                                |
-| ----------------------- | ----------------------------------------------------- |
-| `j` / `↓`               | Move down                                             |
-| `k` / `↑`               | Move up                                               |
-| `l` / `→` / `Enter`     | Open the folder under the cursor                      |
-| `h` / `←` / `Backspace` | Go to the parent folder                               |
-| `gg` / `Home`           | First row                                             |
-| `G` / `End`             | Last row                                              |
-| `/`                     | Search the current folder                             |
-| `n` / `N`               | Next / previous match                                 |
-| `i`                     | Edit the path                                         |
-| `!`                     | Run a shell command                                   |
-| `&`                     | Launch a program detached                             |
-| `Ctrl+C`                | Interrupt the most recent command (again to kill)     |
-| `Esc`                   | Close the output panel, or clear the search highlight |
-| `Ctrl+Q`                | Quit                                                  |
+| Key                     | Action                                                                  |
+| ----------------------- | ----------------------------------------------------------------------- |
+| `j` / `↓`               | Move down                                                               |
+| `k` / `↑`               | Move up                                                                 |
+| `l` / `→` / `Enter`     | Open the folder under the cursor                                        |
+| `h` / `←` / `Backspace` | Go to the parent folder                                                 |
+| `gg` / `Home`           | First row                                                               |
+| `G` / `End`             | Last row                                                                |
+| `/`                     | Search the current folder                                               |
+| `n` / `N`               | Next / previous match                                                   |
+| `Space`                 | Open or close the quick look                                            |
+| `i`                     | Edit the path                                                           |
+| `!`                     | Run a shell command                                                     |
+| `&`                     | Launch a program detached                                               |
+| `Ctrl+C`                | Interrupt the most recent command (again to kill)                       |
+| `Esc`                   | Close the quick look or the output panel, or clear the search highlight |
+| `Ctrl+Q`                | Quit                                                                    |
 
 While searching, `Enter` keeps the cursor on the match, `Esc` goes back to where it was and `↑`/`↓`
 walk the search history. While editing the path, `Enter` goes there and `Esc` cancels. On the

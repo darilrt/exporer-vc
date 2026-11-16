@@ -1478,8 +1478,10 @@ dependencies = [
  "blocking",
  "futures",
  "gpui",
+ "image",
  "jiff",
  "libc",
+ "resvg",
  "unicode-segmentation",
 ]
 
