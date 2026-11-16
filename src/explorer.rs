@@ -76,6 +76,9 @@ const COMMAND_LINE_CONTEXT: &str = "CommandLine";
 /// Context of the status bar while a search is being typed.
 const SEARCH_LINE_CONTEXT: &str = "SearchLine";
 const ROW_HEIGHT: f32 = 32.;
+/// Height of the column names above the list and of the preview panel's title, which share the
+/// same dividing line.
+const SECTION_HEADER_HEIGHT: f32 = 26.;
 /// Height of each line and of the output panel header.
 const OUTPUT_ROW_HEIGHT: f32 = 18.;
 const OUTPUT_HEADER_HEIGHT: f32 = 32.;
@@ -1432,7 +1435,7 @@ impl Explorer {
         // + gap (12).
         let header = div()
             .flex_none()
-            .h(px(38.))
+            .h(px(SECTION_HEADER_HEIGHT))
             .pl(px(53.))
             .pr(px(19.))
             .flex()
@@ -1619,7 +1622,7 @@ impl Explorer {
     fn render_preview(&self, t: &Theme) -> impl IntoElement {
         let header = div()
             .flex_none()
-            .h(px(38.))
+            .h(px(SECTION_HEADER_HEIGHT))
             .px(px(16.))
             .flex()
             .items_center()
