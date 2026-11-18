@@ -1,5 +1,5 @@
 //! Operations on files, with no dependency on the UI: copying and moving entries into a folder,
-//! and the register that `y`/`x` fill and `p` pastes.
+//! and the register that `yy`/`xx` fill and `pp` pastes.
 //!
 //! Nothing is ever overwritten: an entry whose name is taken is pasted as `name (1).ext`.
 
@@ -470,7 +470,7 @@ fn encode_path(bytes: &[u8]) -> String {
     text
 }
 
-/// What `y` or `x` saved for `p`.
+/// What `yy` or `xx` saved for `pp`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Register {
     pub op: Op,

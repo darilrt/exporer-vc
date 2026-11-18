@@ -39,14 +39,14 @@ Zed editor.
   `Shift+↑`/`Shift+↓`), `Ctrl+A`, or `Ctrl`/`Shift`+click.
   Marks are full paths, so they stay when you move to another folder and one operation can take
   entries from several folders. Without marks, operations act on the entry under the cursor.
-- **Copy, cut and paste** with `y`, `x` and `p`, or `Ctrl+C`, `Ctrl+X` and `Ctrl+V`. The register
+- **Copy, cut and paste** with `yy`, `xx` and `pp`, or `Ctrl+C`, `Ctrl+X` and `Ctrl+V`. The register
   is shared by every exporer window of the session (`$XDG_RUNTIME_DIR/exporer/register`), so you
   can copy in one window and paste in another. Nothing is ever overwritten: a taken name becomes `name (1).ext`. Pasting runs in the
   background with a progress row that `Ctrl+C` or its `×` stops; moving across file systems copies
   first and removes the original only if the copy was complete.
-- **Delete** with `d`, which moves entries to the trash (the freedesktop.org trash that Dolphin and
+- **Delete** with `dd`, which asks for confirmation and moves entries to the trash (the freedesktop.org trash that Dolphin and
   Nautilus use, so they can be restored from there), or `D`, which deletes them for good after
-  asking in the status bar.
+  asking in a confirmation dialog.
 - **Quick look** with `Space`: a large preview of the entry under the cursor floats over the list,
   whatever the window size, and follows the cursor as you move.
 
@@ -96,10 +96,10 @@ Marks stay when you change folder. Without marks, operations act on the entry un
 
 | Key               | Action                                                                     |
 | ----------------- | -------------------------------------------------------------------------- |
-| `y` / `Ctrl+C`    | Copy the selection                                                         |
-| `x` / `Ctrl+X`    | Cut the selection                                                          |
-| `p` / `Ctrl+V`    | Paste into the current folder (a taken name becomes `name (1).ext`)        |
-| `d`               | Move to the trash                                                          |
+| `yy` / `Ctrl+C`    | Copy the selection                                                         |
+| `xx` / `Ctrl+X`    | Cut the selection                                                          |
+| `pp` / `Ctrl+V`    | Paste into the current folder (a taken name becomes `name (1).ext`)        |
+| `dd`               | Move to the trash after confirmation                                       |
 | `D`               | Delete permanently; `y` / `Enter` confirms, `n` / `Esc` cancels            |
 | `Ctrl+C` / `×`    | Stop a paste or delete in progress                                         |
 

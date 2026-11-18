@@ -6,7 +6,7 @@
 //! the status bar, and `/` to `Search`, which moves the cursor to the entries that match.
 //! `Space` opens a quick look over the list with a large preview of the entry under the cursor.
 //! `Tab`, `Ctrl+A` and the visual selection (`v`) mark entries, by full path, for the operations
-//! on files: `y` copies and `x` cuts them into a register that `p` pastes in the shown folder.
+//! on files: `yy` copies and `xx` cuts them into a register that `pp` pastes in the shown folder.
 //! `Escape` or losing focus go back to `Normal`. The output of `!` commands
 //! shows in a panel between the list and the status bar; `&` commands are launched detached,
 //! without output.
@@ -94,7 +94,7 @@ const PATH_BAR_CONTEXT: &str = "PathBar";
 const COMMAND_LINE_CONTEXT: &str = "CommandLine";
 /// Context of the status bar while a search is being typed.
 const SEARCH_LINE_CONTEXT: &str = "SearchLine";
-/// Context of the status bar while it asks before deleting for good.
+/// Context of the confirmation dialog before moving to trash or deleting for good.
 const CONFIRM_CONTEXT: &str = "Confirm";
 /// Names shown when asking before deleting; the rest are counted.
 const CONFIRM_NAMES: usize = 3;
@@ -185,14 +185,14 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("tab", ToggleMark, list),
         KeyBinding::new("v", ToggleVisual, list),
         KeyBinding::new("ctrl-a", MarkAll, list),
-        KeyBinding::new("y", Yank, list),
-        KeyBinding::new("x", Cut, list),
-        KeyBinding::new("p", Paste, list),
+        KeyBinding::new("y y", Yank, list),
+        KeyBinding::new("x x", Cut, list),
+        KeyBinding::new("p p", Paste, list),
         KeyBinding::new("ctrl-x", Cut, list),
         KeyBinding::new("ctrl-v", Paste, list),
         KeyBinding::new("shift-down", ExtendDown, list),
         KeyBinding::new("shift-up", ExtendUp, list),
-        KeyBinding::new("d", TrashEntries, list),
+        KeyBinding::new("d d", TrashEntries, list),
         KeyBinding::new("shift-d", DeleteEntries, list),
         KeyBinding::new("y", ConfirmDelete, confirm),
         KeyBinding::new("enter", ConfirmDelete, confirm),
@@ -440,7 +440,7 @@ pub struct Explorer {
     /// Visual selection: the row where it started. The rows between it and the cursor are added
     /// to the marks with `v`.
     visual: Option<usize>,
-    /// What `y`/`x` saved for `p`, shared with the other windows.
+    /// What `yy`/`xx` saved for `pp`, shared with the other windows.
     register: RegisterStore,
     /// The register as read for the last frame.
     register_view: Option<Arc<Register>>,
@@ -448,9 +448,11 @@ pub struct Explorer {
     cut_paths: HashSet<PathBuf>,
     file_tasks: Vec<FileTask>,
     next_file_task: u64,
-    /// What `D` will delete once confirmed.
+    /// Targets captured when opening the confirmation dialog.
     confirm_targets: Option<Vec<PathBuf>>,
-    /// Keyboard focus of the status bar while it asks.
+    /// Whether the pending confirmation deletes permanently instead of moving to trash.
+    confirm_permanent: bool,
+    /// Keyboard focus of the confirmation dialog.
     confirm_focus: FocusHandle,
     notice: Option<Notice>,
     _notice_timer: Option<Task<()>>,
@@ -570,6 +572,7 @@ impl Explorer {
             file_tasks: Vec::new(),
             next_file_task: 0,
             confirm_targets: None,
+            confirm_permanent: false,
             confirm_focus,
             notice: None,
             _notice_timer: None,
@@ -1110,10 +1113,9 @@ impl Explorer {
                 cx.background_executor().timer(SPINNER_INTERVAL).await;
                 let more = this.update(cx, |this, cx| {
                     let animating = !this.file_tasks.is_empty()
-                        || this
-                            .jobs
-                            .iter()
-                            .any(|job| job.running() && (job.visible || this.shown == Some(job.id)));
+                        || this.jobs.iter().any(|job| {
+                            job.running() && (job.visible || this.shown == Some(job.id))
+                        });
                     if !animating {
                         this.spinning = false;
                         return false;
@@ -1160,7 +1162,7 @@ impl Explorer {
     }
 
     /// `Ctrl+C`: stops the most recent command in view or file operation, as in a terminal. With
-    /// nothing running, it copies like `y`, as in a file manager.
+    /// nothing running, it copies like `yy`, as in a file manager.
     fn interrupt(&mut self, _: &Interrupt, _: &mut Window, cx: &mut Context<Self>) {
         let job = self.latest_running_in_view();
         let job_started = job.and_then(|id| self.job(id)).map(|job| job.started);
@@ -1424,12 +1426,12 @@ impl Explorer {
         cx.notify();
     }
 
-    /// `y`: copies the targets into the register.
+    /// `yy`: copies the targets into the register.
     fn yank(&mut self, _: &Yank, _: &mut Window, cx: &mut Context<Self>) {
         self.fill_register(fileops::Op::Copy, cx);
     }
 
-    /// `x`: cuts the targets into the register; `p` moves them.
+    /// `xx`: cuts the targets into the register; `pp` moves them.
     fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
         self.fill_register(fileops::Op::Move, cx);
     }
@@ -1458,10 +1460,14 @@ impl Explorer {
         }
     }
 
-    /// `p`: copies or moves the register's entries into the shown folder, in the background.
+    /// `pp`: copies or moves the register's entries into the shown folder, in the background.
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         let Some(register) = self.register.load().map(Arc::unwrap_or_clone) else {
-            self.show_notice("Nothing to paste: copy with y or cut with x".into(), true, cx);
+            self.show_notice(
+                "Nothing to paste: copy with yy or cut with xx".into(),
+                true,
+                cx,
+            );
             return;
         };
         let dir = self.cwd.clone();
@@ -1476,9 +1482,15 @@ impl Explorer {
                 fileops::paste(register.op, &register.paths, &dir, progress)
             }
         };
-        self.start_file_task(verb, register.paths.len(), work, cx, move |this, report, cx| {
-            this.paste_finished(register, dir, report, cx);
-        });
+        self.start_file_task(
+            verb,
+            register.paths.len(),
+            work,
+            cx,
+            move |this, report, cx| {
+                this.paste_finished(register, dir, report, cx);
+            },
+        );
     }
 
     /// Runs `work` on a thread of its own with a row that shows its progress, then `done` with
@@ -1526,7 +1538,7 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         // A move empties the register, except for what could not be moved. If it was replaced
-        // meanwhile (another `y` or `x`), it is left alone.
+        // meanwhile (another `yy` or `xx`), it is left alone.
         if register.op == fileops::Op::Move && self.register.load().as_deref() == Some(&register) {
             let left: Vec<PathBuf> = report
                 .failures
@@ -1566,47 +1578,62 @@ impl Explorer {
         }
     }
 
-    /// `d`: moves the targets to the trash, without asking: they can be restored from there.
-    fn trash(&mut self, _: &TrashEntries, _: &mut Window, cx: &mut Context<Self>) {
-        let paths = self.take_targets();
-        if paths.is_empty() {
-            cx.notify();
-            return;
-        }
+    /// `dd`: asks before moving the targets to the trash.
+    fn trash(&mut self, _: &TrashEntries, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask_removal(false, window, cx);
+    }
+
+    fn move_to_trash(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         self.marks.clear();
         let total = paths.len();
         let work = move |progress: &fileops::Progress| {
             fileops::trash_all(fileops::Trash::session().as_ref(), &paths, progress)
         };
-        self.start_file_task("Moving to the trash", total, work, cx, move |this, report, cx| {
-            let (mut text, failed) = report_text("Moved", " to the trash", total, &report);
-            if failed {
-                text.push_str(" · D deletes permanently");
-            }
-            this.show_notice(text, failed, cx);
-            this.after_removal(cx);
-        });
+        self.start_file_task(
+            "Moving to the trash",
+            total,
+            work,
+            cx,
+            move |this, report, cx| {
+                let (mut text, failed) = report_text("Moved", " to the trash", total, &report);
+                if failed {
+                    text.push_str(" · D deletes permanently");
+                }
+                this.show_notice(text, failed, cx);
+                this.after_removal(cx);
+            },
+        );
     }
 
-    /// `D`: asks in the status bar before deleting the targets for good.
+    /// `D`: asks before deleting the targets for good.
     fn ask_delete(&mut self, _: &DeleteEntries, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask_removal(true, window, cx);
+    }
+
+    fn ask_removal(&mut self, permanent: bool, window: &mut Window, cx: &mut Context<Self>) {
         let paths = self.take_targets();
         if paths.is_empty() {
             cx.notify();
             return;
         }
         self.confirm_targets = Some(paths);
+        self.confirm_permanent = permanent;
         self.mode = Mode::Confirm;
         window.focus(&self.confirm_focus);
         cx.notify();
     }
 
-    /// `y` or `Enter` while asking: deletes the targets for good.
+    /// Confirm the captured targets, using the removal method shown in the dialog.
     fn confirm_delete(&mut self, _: &ConfirmDelete, window: &mut Window, cx: &mut Context<Self>) {
         let Some(paths) = self.confirm_targets.take() else {
             return;
         };
+        let permanent = self.confirm_permanent;
         self.leave_edit(window, cx);
+        if !permanent {
+            self.move_to_trash(paths, cx);
+            return;
+        }
         self.marks.clear();
         let total = paths.len();
         let work = move |progress: &fileops::Progress| fileops::delete_all(&paths, progress);
@@ -2212,7 +2239,10 @@ impl Explorer {
                 let (icon_path, color) = if candidate.is_dir {
                     (icon::FOLDER, t.accent)
                 } else {
-                    (listing::kind_of(&candidate.name, false).icon(), t.text_muted)
+                    (
+                        listing::kind_of(&candidate.name, false).icon(),
+                        t.text_muted,
+                    )
                 };
                 div()
                     .h(px(COMPLETION_ROW_HEIGHT))
@@ -2686,7 +2716,11 @@ impl Explorer {
                 .flex_col()
                 .children(more)
                 .children(rows)
-                .children(tasks.into_iter().map(|task| self.render_file_task(task, t, cx))),
+                .children(
+                    tasks
+                        .into_iter()
+                        .map(|task| self.render_file_task(task, t, cx)),
+                ),
         )
     }
 
@@ -2844,6 +2878,127 @@ impl Explorer {
         elements
     }
 
+    /// Covers the whole window so file actions cannot receive clicks while asking.
+    fn render_confirmation(&self, t: &Theme, cx: &Context<Self>) -> Option<Div> {
+        if self.mode != Mode::Confirm {
+            return None;
+        }
+        let paths = self.confirm_targets.as_deref().unwrap_or_default();
+        let mut names: Vec<String> = paths
+            .iter()
+            .take(CONFIRM_NAMES)
+            .map(|path| {
+                path.file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        if paths.len() > CONFIRM_NAMES {
+            names.push(format!("+{} more", paths.len() - CONFIRM_NAMES));
+        }
+        let question = if self.confirm_permanent {
+            format!(
+                "Are you sure you want to permanently delete {}?",
+                items(paths.len())
+            )
+        } else {
+            format!(
+                "Are you sure you want to move {} to the trash?",
+                items(paths.len())
+            )
+        };
+        let confirm_label = if self.confirm_permanent {
+            "Delete permanently"
+        } else {
+            "Move to trash"
+        };
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .key_context(CONFIRM_CONTEXT)
+                .track_focus(&self.confirm_focus)
+                .on_action(cx.listener(Self::confirm_delete))
+                .on_action(cx.listener(Self::cancel_edit))
+                .bg(gpui::rgba(0x00000099))
+                .p(px(20.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(500.))
+                        .max_w_full()
+                        .p(px(24.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(18.))
+                        .rounded(px(12.))
+                        .bg(t.raised_bg)
+                        .border_1()
+                        .border_color(t.border_strong)
+                        .child(
+                            div()
+                                .text_size(px(16.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(t.text_bright)
+                                .child(question),
+                        )
+                        .child(
+                            div()
+                                .font_family(MONO_FONT)
+                                .text_color(t.text_muted)
+                                .child(names.join(", ")),
+                        )
+                        .child(
+                            div()
+                                .text_color(t.text_muted)
+                                .child(if self.confirm_permanent {
+                                    "This cannot be undone."
+                                } else {
+                                    "You can restore these items from the trash."
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(12.))
+                                .child(
+                                    div()
+                                        .id("cancel-removal")
+                                        .px(px(14.))
+                                        .py(px(8.))
+                                        .rounded(px(6.))
+                                        .border_1()
+                                        .border_color(t.border_strong)
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.leave_edit(window, cx)
+                                        }))
+                                        .child("Cancel (Esc)"),
+                                )
+                                .child(
+                                    div()
+                                        .id("confirm-removal")
+                                        .px(px(14.))
+                                        .py(px(8.))
+                                        .rounded(px(6.))
+                                        .bg(t.danger)
+                                        .text_color(t.on_accent)
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.confirm_delete(&ConfirmDelete, window, cx);
+                                        }))
+                                        .child(format!("{confirm_label} (Enter)")),
+                                ),
+                        ),
+                ),
+        )
+    }
+
     fn render_status(&self, t: &Theme, cx: &Context<Self>) -> impl IntoElement {
         let (mode_label, mode_color) = match self.mode {
             Mode::Normal if self.visual.is_some() => ("VISUAL", t.visual),
@@ -2879,59 +3034,6 @@ impl Explorer {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(mode_label),
             );
-        let hints = |hints: Vec<Div>| {
-            div()
-                .flex_none()
-                .pr(px(6.))
-                .flex()
-                .items_center()
-                .gap(px(10.))
-                .children(hints)
-        };
-
-        if self.mode == Mode::Confirm {
-            let paths = self.confirm_targets.as_deref().unwrap_or_default();
-            let mut names: Vec<String> = paths
-                .iter()
-                .take(CONFIRM_NAMES)
-                .map(|path| {
-                    path.file_name()
-                        .unwrap_or(path.as_os_str())
-                        .to_string_lossy()
-                        .into_owned()
-                })
-                .collect();
-            if paths.len() > CONFIRM_NAMES {
-                names.push(format!("+{} more", paths.len() - CONFIRM_NAMES));
-            }
-            return bar
-                .key_context(CONFIRM_CONTEXT)
-                .track_focus(&self.confirm_focus)
-                .on_action(cx.listener(Self::confirm_delete))
-                .on_action(cx.listener(Self::cancel_edit))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(px(13.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(t.text_bright)
-                        .child(format!("Delete {} permanently?", items(paths.len()))),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .font_family(MONO_FONT)
-                        .text_size(px(12.))
-                        .text_color(t.text_muted)
-                        .child(names.join(", ")),
-                )
-                .child(hints(vec![
-                    hint(t, &["y", "Enter"], "delete"),
-                    hint(t, &["n", "Esc"], "cancel"),
-                ]));
-        }
 
         if self.mode == Mode::Search {
             let text = self.search_input.read(cx).text().to_owned();
@@ -3150,6 +3252,7 @@ impl Render for Explorer {
             )
             .child(self.render_status(&t, cx))
             .children(self.render_completion(&t))
+            .children(self.render_confirmation(&t, cx))
     }
 }
 
@@ -3269,10 +3372,10 @@ fn report_text(verb: &str, place: &str, total: usize, report: &fileops::Report) 
         text.push_str(" · stopped");
     }
     if let Some(failure) = report.failures.first() {
-        let name = failure
-            .path
-            .file_name()
-            .map_or_else(|| failure.path.to_string_lossy(), |name| name.to_string_lossy());
+        let name = failure.path.file_name().map_or_else(
+            || failure.path.to_string_lossy(),
+            |name| name.to_string_lossy(),
+        );
         text.push_str(&format!(" · {name}: {}", failure.reason));
         if report.failures.len() > 1 {
             text.push_str(&format!(" (+{} more)", report.failures.len() - 1));
